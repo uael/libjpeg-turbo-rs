@@ -163,6 +163,11 @@ pub struct CompressParams<'a> {
     pub optimize_huffman: bool,
     /// Input smoothing strength 0-100, as C's `smoothing_factor`.
     pub smoothing_factor: u8,
+    /// Bytes from the start of one row of `pixels` to the start of the next, as the `pitch` of
+    /// C's `tj3Compress8`; 0 means rows packed with no gap. Rows with a gap are taken by the
+    /// single-pass encode of RGB, RGBA, BGR and BGRA samples; every other path answers
+    /// `Unsupported` for them.
+    pub pitch: usize,
 }
 
 impl<'a> CompressParams<'a> {
@@ -189,6 +194,7 @@ impl<'a> CompressParams<'a> {
             custom_ac_huffman: None,
             optimize_huffman: false,
             smoothing_factor: 0,
+            pitch: 0,
         }
     }
 
@@ -225,6 +231,32 @@ impl<'a> CompressParams<'a> {
     pub fn smoothing_factor(mut self, factor: u8) -> Self {
         self.smoothing_factor = factor.min(100);
         self
+    }
+
+    pub fn pitch(mut self, pitch: usize) -> Self {
+        self.pitch = pitch;
+        self
+    }
+
+    /// The bytes from the start of one row to the start of the next.
+    fn row_pitch(&self) -> usize {
+        match self.pitch {
+            0 => self.width * self.pixel_format.bytes_per_pixel(),
+            pitch => pitch,
+        }
+    }
+
+    /// An error when the rows have a gap, for a path that reads packed rows alone.
+    fn packed(&self) -> Result<()> {
+        let row = self.width * self.pixel_format.bytes_per_pixel();
+        if self.row_pitch() == row {
+            return Ok(());
+        }
+        Err(JpegError::Unsupported(format!(
+            "a row pitch of {} for rows of {row} bytes: only the single-pass encode of RGB, RGBA, \
+             BGR and BGRA samples reads rows with a gap",
+            self.row_pitch()
+        )))
     }
 }
 
@@ -326,6 +358,7 @@ pub fn compress_with_params(params: &CompressParams<'_>) -> Result<Vec<u8>> {
         custom_ac_huffman,
         optimize_huffman,
         smoothing_factor,
+        pitch: _,
     } = *params;
 
     // Two-pass optimized Huffman, and smoothing, both need full-plane
@@ -350,7 +383,14 @@ pub fn compress_with_params(params: &CompressParams<'_>) -> Result<Vec<u8>> {
     }
 
     let bpp = pixel_format.bytes_per_pixel();
-    let expected_size = width * height * bpp;
+    let pitch = params.row_pitch();
+    if pitch < width * bpp {
+        return Err(JpegError::Unsupported(format!(
+            "a row pitch of {pitch} for rows of {} bytes",
+            width * bpp
+        )));
+    }
+    let expected_size = (height - 1) * pitch + width * bpp;
     if pixels.len() < expected_size {
         return Err(JpegError::BufferTooSmall {
             need: expected_size,
@@ -539,7 +579,7 @@ pub fn compress_with_params(params: &CompressParams<'_>) -> Result<Vec<u8>> {
             // Convert this MCU row's pixel data to YCbCr
             for row in 0..rows_available {
                 let src_row: usize = y0 + row;
-                let src_offset: usize = src_row * width * bpp;
+                let src_offset: usize = src_row * pitch;
                 let dst_offset: usize = row * padded_w;
                 color_convert_fn(
                     &pixels[src_offset..src_offset + width * bpp],
@@ -854,6 +894,7 @@ pub fn compress_with_params(params: &CompressParams<'_>) -> Result<Vec<u8>> {
             }
         }
     } else {
+        params.packed()?;
         // Fallback: full-plane color conversion for non-RGB formats and grayscale
         let (y_plane, cb_plane, cr_plane) = convert_to_ycbcr(
             pixels,
@@ -1562,6 +1603,7 @@ fn compress_cmyk(params: &CompressParams<'_>) -> Result<Vec<u8>> {
 /// narrower signature, and each dropped the options it could not express —
 /// five of them for CMYK (#313), six for RGB-direct (#343), all silently.
 fn compress_direct_planar(params: &CompressParams<'_>, spec: &DirectPlanarSpec) -> Result<Vec<u8>> {
+    params.packed()?;
     let CompressParams {
         pixels,
         width,
@@ -8884,6 +8926,7 @@ pub fn compress_optimized(
 /// tables from the actual symbol statistics, which is the point of the pass,
 /// and matches libjpeg when both are supplied.
 pub fn compress_optimized_with_params(params: &CompressParams<'_>) -> Result<Vec<u8>> {
+    params.packed()?;
     let CompressParams {
         pixels,
         width,
@@ -8898,6 +8941,7 @@ pub fn compress_optimized_with_params(params: &CompressParams<'_>) -> Result<Vec
         custom_ac_huffman,
         optimize_huffman,
         smoothing_factor,
+        pitch: _,
     } = *params;
     // Validate inputs
     if width == 0 || height == 0 {
