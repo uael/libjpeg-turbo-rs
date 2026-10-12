@@ -339,13 +339,24 @@ fn pad_alpha_offset(format: PixelFormat) -> Option<usize> {
     }
 }
 
-/// Claim the output destination for a terminal decode branch: the
-/// caller's buffer when a sink is armed (validated against `size`, so a
-/// short buffer is a typed error, never a panic or truncation), else a
-/// fresh zero-filled `Vec`.
-fn take_out_buf<'a>(sink: &mut Option<&'a mut [u8]>, size: usize) -> Result<OutBuf<'a>> {
-    match sink.take() {
-        Some(buf) => {
+/// The caller's output destination for one decode: none (`decode_image`),
+/// one buffer of packed rows (`decode_image_into`), or one slice per row
+/// (`decode_image_into_rows`). A terminal branch takes it at most once.
+enum Sink<'a, 'b> {
+    None,
+    Whole(&'a mut [u8]),
+    Rows(&'a mut [&'b mut [u8]]),
+}
+
+/// Claim the output destination for a terminal decode branch that
+/// writes packed rows: the caller's buffer when one is armed (validated
+/// against `size`, so a short buffer is a typed error, never a panic or
+/// truncation), else a fresh zero-filled `Vec`. Rows the caller gave
+/// one by one stay armed: the branch writes a `Vec`, which
+/// `decode_image_into_rows` copies.
+fn take_out_buf<'a>(sink: &mut Sink<'a, '_>, size: usize) -> Result<OutBuf<'a>> {
+    match core::mem::replace(sink, Sink::None) {
+        Sink::Whole(buf) => {
             if buf.len() < size {
                 return Err(JpegError::BufferTooSmall {
                     need: size,
@@ -354,8 +365,76 @@ fn take_out_buf<'a>(sink: &mut Option<&'a mut [u8]>, size: usize) -> Result<OutB
             }
             Ok(OutBuf::Borrowed(&mut buf[..size]))
         }
-        None => Ok(OutBuf::Owned(vec![0u8; size])),
+        Sink::Rows(rows) => {
+            *sink = Sink::Rows(rows);
+            Ok(OutBuf::Owned(vec![0u8; size]))
+        }
+        Sink::None => Ok(OutBuf::Owned(vec![0u8; size])),
     }
+}
+
+/// Output rows for a terminal decode branch that writes one row at a
+/// time: `height` rows of `row` bytes, in the caller's destination when
+/// one is armed, else in a fresh zero-filled `Vec`.
+struct OutRows<'a, 'b> {
+    rows: OutRowsMem<'a, 'b>,
+    row: usize,
+}
+
+enum OutRowsMem<'a, 'b> {
+    Packed(OutBuf<'a>),
+    Given(&'a mut [&'b mut [u8]]),
+}
+
+impl OutRows<'_, '_> {
+    /// Row `y`, exactly `row` bytes.
+    fn row(&mut self, y: usize) -> &mut [u8] {
+        let row = self.row;
+        match &mut self.rows {
+            OutRowsMem::Packed(packed) => &mut packed[y * row..(y + 1) * row],
+            OutRowsMem::Given(rows) => &mut rows[y][..row],
+        }
+    }
+
+    /// See [`OutBuf::into_vec`]: empty when the rows are the caller's.
+    fn into_vec(self) -> Vec<u8> {
+        match self.rows {
+            OutRowsMem::Packed(packed) => packed.into_vec(),
+            OutRowsMem::Given(_) => Vec::new(),
+        }
+    }
+}
+
+/// Claim `height` rows of `row` bytes for a terminal decode branch; see
+/// [`OutRows`]. Rows the caller gave are validated here, so a short row
+/// or too few rows is a typed error, never a panic or truncation.
+fn take_out_rows<'a, 'b>(
+    sink: &mut Sink<'a, 'b>,
+    height: usize,
+    row: usize,
+) -> Result<OutRows<'a, 'b>> {
+    let rows = match core::mem::replace(sink, Sink::None) {
+        Sink::Rows(rows) => {
+            let fits: bool =
+                rows.len() >= height && rows[..height].iter().all(|line| line.len() >= row);
+            if !fits {
+                return Err(JpegError::BufferTooSmall {
+                    need: height * row,
+                    got: rows
+                        .iter()
+                        .take(height)
+                        .map(|line| line.len().min(row))
+                        .sum(),
+                });
+            }
+            OutRowsMem::Given(rows)
+        }
+        armed => {
+            *sink = armed;
+            OutRowsMem::Packed(take_out_buf(sink, height * row)?)
+        }
+    };
+    Ok(OutRows { rows, row })
 }
 
 impl Image {
@@ -3994,7 +4073,7 @@ impl<'a> Decoder<'a> {
     /// allocation on the standard direct-output paths; its docs list the
     /// staged exceptions).
     pub fn decode_image(&self) -> Result<Image> {
-        self.decode_image_with_sink(&mut None)
+        self.decode_image_with_sink(&mut Sink::None)
     }
 
     /// Header-derived limit checks shared by every decode entry point
@@ -4147,9 +4226,12 @@ impl<'a> Decoder<'a> {
         // be expressed in a caller buffer written at full height — stage
         // those decodes.
         let use_sink: bool = self.crop_y.is_none() && self.crop_height.is_none();
-        let mut sink: Option<&mut [u8]> = if use_sink { Some(&mut *out) } else { None };
+        let mut sink: Sink = match use_sink {
+            true => Sink::Whole(&mut *out),
+            false => Sink::None,
+        };
         let image: Image = self.decode_image_with_sink(&mut sink)?;
-        let sink_consumed: bool = use_sink && sink.is_none();
+        let sink_consumed: bool = use_sink && matches!(sink, Sink::None);
 
         // Structural, not asserted: the staged path reports exactly what
         // it copied, so a hypothetical path producing data shorter than
@@ -4184,7 +4266,66 @@ impl<'a> Decoder<'a> {
         })
     }
 
-    fn decode_image_with_sink(&self, sink: &mut Option<&mut [u8]>) -> Result<Image> {
+    /// Decode into rows the caller gives one by one, such as rows a
+    /// pitch apart or rows over several buffers: row `y` of the output
+    /// goes into the start of `rows[y]`, and the bytes past it are left
+    /// as they were.
+    ///
+    /// `rows` must hold at least the output's height in rows, each of at
+    /// least a row of [`Self::output_buffer_size`]; else the decode is a
+    /// typed [`JpegError::BufferTooSmall`]. The 3-component YCbCr output
+    /// paths write each row in place, with no output-sized allocation;
+    /// every other path stages through an internal buffer and copies its
+    /// rows, as [`Self::decode_image_into`] does.
+    ///
+    /// On error the contents of `rows` are unspecified.
+    pub fn decode_image_into_rows(&self, rows: &mut [&mut [u8]]) -> Result<ImageInfo> {
+        let use_sink: bool = self.crop_y.is_none() && self.crop_height.is_none();
+        let mut sink: Sink = match use_sink {
+            true => Sink::Rows(&mut *rows),
+            false => Sink::None,
+        };
+        let image: Image = self.decode_image_with_sink(&mut sink)?;
+        let sink_consumed: bool = use_sink && matches!(sink, Sink::None);
+        drop(sink);
+        let row: usize = image.width * image.pixel_format.bytes_per_pixel();
+        if !sink_consumed {
+            let fits: bool = rows.len() >= image.height
+                && rows[..image.height].iter().all(|line| line.len() >= row);
+            if !fits {
+                return Err(JpegError::BufferTooSmall {
+                    need: image.data.len(),
+                    got: rows
+                        .iter()
+                        .take(image.height)
+                        .map(|line| line.len().min(row))
+                        .sum(),
+                });
+            }
+            if row > 0 {
+                for (line, data) in rows.iter_mut().zip(image.data.chunks_exact(row)) {
+                    line[..row].copy_from_slice(data);
+                }
+            }
+        }
+        Ok(ImageInfo {
+            width: image.width,
+            height: image.height,
+            pixel_format: image.pixel_format,
+            precision: image.precision,
+            bytes_written: row * image.height,
+            icc_profile: image.icc_profile,
+            exif_data: image.exif_data,
+            xmp_data: image.xmp_data,
+            iptc_data: image.iptc_data,
+            comment: image.comment,
+            density: image.density,
+            saved_markers: image.saved_markers,
+            warnings: image.warnings,
+        })
+    }
+
+    fn decode_image_with_sink(&self, sink: &mut Sink<'_, '_>) -> Result<Image> {
         let mut image: Image = self.decode_image_inner(sink)?;
         if !self.marker_processors.is_empty() {
             for marker in &image.saved_markers {
@@ -4442,7 +4583,7 @@ impl<'a> Decoder<'a> {
     /// Branches with native support claim it via `take_out_buf` (which
     /// leaves it `None`); branches without leave it untouched and the
     /// wrapper stages through the returned owned `data` instead.
-    fn decode_image_inner(&self, sink: &mut Option<&mut [u8]>) -> Result<Image> {
+    fn decode_image_inner(&self, sink: &mut Sink<'_, '_>) -> Result<Image> {
         let frame = &self.metadata.frame;
         let width = frame.width as usize;
         let height = frame.height as usize;
@@ -4738,7 +4879,7 @@ impl<'a> Decoder<'a> {
                 let exact_geometry: bool = off == 0
                     && comp_w == out_width
                     && component_planes[0].len() == comp_w * out_height;
-                let data: Vec<u8> = if sink.is_some() {
+                let data: Vec<u8> = if !matches!(sink, Sink::None) {
                     let mut buf = take_out_buf(sink, out_width * out_height)?;
                     if exact_geometry {
                         buf.copy_from_slice(&component_planes[0]);
@@ -5180,8 +5321,7 @@ impl<'a> Decoder<'a> {
                     // Row-streaming H2V2: fuse upsample + color convert to avoid
                     // allocating full-size cb_full/cr_full buffers (~4MB for 1080p).
                     // Process 2 output rows at a time, keeping data in L1/L2 cache.
-                    let data_size = out_width * out_height * bpp;
-                    let mut data = take_out_buf(sink, data_size)?;
+                    let mut data = take_out_rows(sink, out_height, out_width * bpp)?;
 
                     // Small per-row upsample buffers (2 rows × full_width per component)
                     let mut cb_row_top = vec![0u8; full_width];
@@ -5240,7 +5380,7 @@ impl<'a> Decoder<'a> {
                                 &y_plane[out_y_top * y_width + y_off..],
                                 &cb_row_top,
                                 &cr_row_top,
-                                &mut data[out_y_top * out_width * bpp..],
+                                data.row(out_y_top),
                                 out_width,
                                 out_y_top,
                             );
@@ -5251,7 +5391,7 @@ impl<'a> Decoder<'a> {
                                 &y_plane[out_y_bot * y_width + y_off..],
                                 &cb_row_bot,
                                 &cr_row_bot,
-                                &mut data[out_y_bot * out_width * bpp..],
+                                data.row(out_y_bot),
                                 out_width,
                                 out_y_bot,
                             );
@@ -5294,8 +5434,7 @@ impl<'a> Decoder<'a> {
                     && actual_cb_w > 2
                     && block_size == 8
                 {
-                    let data_size: usize = out_width * out_height * bpp;
-                    let mut data = take_out_buf(sink, data_size)?;
+                    let mut data = take_out_rows(sink, out_height, out_width * bpp)?;
 
                     // Per-row upsample scratch (full_width per component).
                     let mut cb_row: Vec<u8> = vec![0u8; full_width];
@@ -5327,7 +5466,7 @@ impl<'a> Decoder<'a> {
                             &y_plane[y * y_width + y_off..],
                             &cb_row,
                             &cr_row,
-                            &mut data[y * out_width * bpp..],
+                            data.row(y),
                             out_width,
                             y,
                         );
@@ -5361,8 +5500,7 @@ impl<'a> Decoder<'a> {
                     && v_factor == 2
                     && block_size == 8
                 {
-                    let data_size: usize = out_width * out_height * bpp;
-                    let mut data = take_out_buf(sink, data_size)?;
+                    let mut data = take_out_rows(sink, out_height, out_width * bpp)?;
 
                     let mut cb_row: Vec<u8> = vec![0u8; full_width];
                     let mut cr_row: Vec<u8> = vec![0u8; full_width];
@@ -5406,7 +5544,7 @@ impl<'a> Decoder<'a> {
                                 &y_plane[out_y * y_width + y_off..],
                                 &cb_row,
                                 &cr_row,
-                                &mut data[out_y * out_width * bpp..],
+                                data.row(out_y),
                                 out_width,
                                 out_y,
                             );
@@ -5456,8 +5594,7 @@ impl<'a> Decoder<'a> {
                     && nearest_eligible(cb_h_factor, cb_v_factor, actual_cb_w)
                     && nearest_eligible(cr_h_factor, cr_v_factor, actual_cr_w)
                 {
-                    let data_size: usize = out_width * out_height * bpp;
-                    let mut data = take_out_buf(sink, data_size)?;
+                    let mut data = take_out_rows(sink, out_height, out_width * bpp)?;
 
                     let mut cb_row: Vec<u8> = vec![0u8; full_width];
                     let mut cr_row: Vec<u8> = vec![0u8; full_width];
@@ -5532,7 +5669,7 @@ impl<'a> Decoder<'a> {
                             &y_plane[y * y_width + y_off..],
                             &cb_row,
                             &cr_row,
-                            &mut data[y * out_width * bpp..],
+                            data.row(y),
                             out_width,
                             y,
                         );
@@ -5687,15 +5824,14 @@ impl<'a> Decoder<'a> {
                 // We use a trick: leak the Vecs temporarily, do the conversion,
                 // then reconstruct and drop them. But simpler: just use a nested scope.
                 // Actually, let's just do the color conversion here and return.
-                let data_size = out_width * out_height * bpp;
-                let mut data = take_out_buf(sink, data_size)?;
+                let mut data = take_out_rows(sink, out_height, out_width * bpp)?;
                 for y in 0..out_height {
                     self.color_convert_row(
                         out_format,
                         &y_plane[y * y_width + comp_x_offsets[0]..],
                         &cb_full[y * full_width..],
                         &cr_full[y * full_width..],
-                        &mut data[y * out_width * bpp..],
+                        data.row(y),
                         out_width,
                         y,
                     );
@@ -5719,15 +5855,14 @@ impl<'a> Decoder<'a> {
             }
 
             // 4:4:4 path (no upsampling)
-            let data_size = out_width * out_height * bpp;
-            let mut data = take_out_buf(sink, data_size)?;
+            let mut data = take_out_rows(sink, out_height, out_width * bpp)?;
             for y in 0..out_height {
                 self.color_convert_row(
                     out_format,
                     &y_plane[y * y_width + comp_x_offsets[0]..],
                     &cb_data[y * cb_stride + comp_x_offsets[1]..],
                     &cr_data[y * cr_stride + comp_x_offsets[2]..],
-                    &mut data[y * out_width * bpp..],
+                    data.row(y),
                     out_width,
                     y,
                 );
