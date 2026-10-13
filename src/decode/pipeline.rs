@@ -4947,18 +4947,16 @@ impl<'a> Decoder<'a> {
                     && comp_w == out_width
                     && component_planes[0].len() == comp_w * out_height;
                 let data: Vec<u8> = if !matches!(sink, Sink::None) {
-                    let mut buf = take_out_buf(sink, out_width * out_height)?;
-                    if exact_geometry {
-                        buf.copy_from_slice(&component_planes[0]);
-                    } else {
-                        for y in 0..out_height {
-                            buf[y * out_width..(y + 1) * out_width].copy_from_slice(
+                    let mut data = take_out_rows(sink, out_height, out_width)?;
+                    for y in 0..out_height {
+                        data.write(y, |row| {
+                            row.copy_from_slice(
                                 &component_planes[0]
                                     [y * comp_w + off..y * comp_w + off + out_width],
-                            );
-                        }
+                            )
+                        });
                     }
-                    buf.into_vec()
+                    data.into_vec()
                 } else if exact_geometry {
                     core::mem::take(&mut component_planes[0])
                 } else {
@@ -5112,18 +5110,18 @@ impl<'a> Decoder<'a> {
                     }
                 }
 
-                let data_size: usize = out_width * out_height * 3;
-                let mut data = take_out_buf(sink, data_size)?;
+                let mut data = take_out_rows(sink, out_height, out_width * 3)?;
                 for y in 0..out_height {
                     let r_row: &[u8] = &r_plane[y * r_stride + comp_x_offsets[0]..];
                     let g_row: &[u8] = &g_plane[y * g_stride + comp_x_offsets[1]..];
                     let b_row: &[u8] = &b_plane[y * b_stride + comp_x_offsets[2]..];
-                    let out_row: &mut [u8] = &mut data[y * out_width * 3..][..out_width * 3];
-                    for x in 0..out_width {
-                        out_row[x * 3] = r_row[x];
-                        out_row[x * 3 + 1] = g_row[x];
-                        out_row[x * 3 + 2] = b_row[x];
-                    }
+                    data.write(y, |out_row| {
+                        for x in 0..out_width {
+                            out_row[x * 3] = r_row[x];
+                            out_row[x * 3 + 1] = g_row[x];
+                            out_row[x * 3 + 2] = b_row[x];
+                        }
+                    });
                 }
 
                 return Ok(Image {
