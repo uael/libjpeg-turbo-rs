@@ -264,6 +264,16 @@ pub fn read_coefficients(data: &[u8]) -> Result<JpegCoefficients> {
 /// Encodes quantized DCT coefficients using Huffman coding,
 /// producing a valid baseline JPEG file.
 pub fn write_coefficients(coeffs: &JpegCoefficients) -> Result<Vec<u8>> {
+    collected(|out| write_coefficients_to(coeffs, &[], out))
+}
+
+/// [`write_coefficients`], whose file goes to `out` in order, with `markers` after its JFIF
+/// segment: its header, then its entropy-coded data with no copy of it, then EOI.
+fn write_coefficients_to(
+    coeffs: &JpegCoefficients,
+    markers: &[SavedMarker],
+    out: &mut dyn FnMut(&[u8]),
+) -> Result<()> {
     let num_components = coeffs.components.len();
     let is_grayscale = num_components == 1;
 
@@ -390,8 +400,8 @@ pub fn write_coefficients(coeffs: &JpegCoefficients) -> Result<Vec<u8>> {
 
     bit_writer.flush();
 
-    // Assemble output
-    let mut output = Vec::with_capacity(bit_writer.data().len() + 1024);
+    // Assemble the header; the entropy-coded data follows it in `emit`.
+    let mut output = Vec::with_capacity(1024);
 
     marker_writer::write_soi(&mut output);
     // Preserve source JFIF density (matches C jpegtran behavior)
@@ -491,10 +501,8 @@ pub fn write_coefficients(coeffs: &JpegCoefficients) -> Result<Vec<u8>> {
         .collect();
     marker_writer::write_sos(&mut output, &scan_components);
 
-    output.extend_from_slice(bit_writer.data());
-    marker_writer::write_eoi(&mut output);
-
-    Ok(output)
+    emit(&output, markers, bit_writer.data(), out);
+    Ok(())
 }
 
 /// Apply a lossless transform to a JPEG image.
@@ -520,6 +528,18 @@ pub fn transform_jpeg(data: &[u8], op: TransformOp) -> Result<Vec<u8>> {
 /// Supports all 9 flags from libjpeg-turbo: perfect, trim, crop, grayscale,
 /// no_output, progressive, arithmetic, optimize, and copy_markers.
 pub fn transform_jpeg_with_options(data: &[u8], options: &TransformOptions) -> Result<Vec<u8>> {
+    collected(|out| transform_jpeg_to(data, options, out))
+}
+
+/// [`transform_jpeg_with_options`], whose file goes to `out` in order, in parts of any length,
+/// as libjpeg's destination manager takes it. A sequential Huffman file goes as its header, then
+/// its entropy-coded data, with no copy of either, then EOI. With `no_output`, `out` gets nothing.
+/// On error, the parts given before the error are of a failed transform.
+pub fn transform_jpeg_to(
+    data: &[u8],
+    options: &TransformOptions,
+    out: &mut dyn FnMut(&[u8]),
+) -> Result<()> {
     // Read saved markers from the source based on copy_markers mode.
     let saved_markers: Vec<SavedMarker> = match options.copy_markers {
         crate::transform::MarkerCopyMode::All => {
@@ -991,9 +1011,9 @@ pub fn transform_jpeg_with_options(data: &[u8], options: &TransformOptions) -> R
         }
     }
 
-    // NO_OUTPUT: skip writing, return empty.
+    // NO_OUTPUT: skip writing.
     if options.no_output {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     // Apply restart interval: preserve source RI unless user explicitly overrides.
@@ -1092,6 +1112,7 @@ pub fn transform_jpeg_with_options(data: &[u8], options: &TransformOptions) -> R
     // beyond the Annex K range (DC > 11, AC > 10).
     let force_optimize: bool =
         coeffs.effective_precision() > 8 || needs_optimized_baseline_huffman(&coeffs);
+    // Saved markers from the source go after the JFIF segment, if copy_markers is enabled.
     let output: Vec<u8> = if options.arithmetic && progressive_safe {
         write_coefficients_progressive_arithmetic(&coeffs, progressive_restart_rows)?
     } else if options.arithmetic {
@@ -1099,20 +1120,18 @@ pub fn transform_jpeg_with_options(data: &[u8], options: &TransformOptions) -> R
     } else if progressive_safe {
         write_coefficients_progressive(&coeffs, progressive_restart_rows)?
     } else if options.optimize || force_optimize {
-        write_coefficients_optimized(&coeffs)?
+        return write_coefficients_optimized_to(&coeffs, &saved_markers, out);
     } else {
-        write_coefficients(&coeffs)?
+        return write_coefficients_to(&coeffs, &saved_markers, out);
     };
-
-    // Inject saved markers from the source if copy_markers is enabled.
-    if !saved_markers.is_empty() {
-        Ok(encoder_pipeline::inject_saved_markers(
+    match saved_markers.is_empty() {
+        true => out(&output),
+        false => out(&encoder_pipeline::inject_saved_markers(
             &output,
             &saved_markers,
-        ))
-    } else {
-        Ok(output)
+        )),
     }
+    Ok(())
 }
 
 fn huffman_category(value: i16) -> u8 {
@@ -1205,6 +1224,16 @@ fn needs_optimized_baseline_huffman(coeffs: &JpegCoefficients) -> bool {
 /// Pass 1 gathers symbol frequencies from the coefficient data, then
 /// generates optimal Huffman tables. Pass 2 encodes with those tables.
 pub fn write_coefficients_optimized(coeffs: &JpegCoefficients) -> Result<Vec<u8>> {
+    collected(|out| write_coefficients_optimized_to(coeffs, &[], out))
+}
+
+/// [`write_coefficients_optimized`], whose file goes to `out` as [`write_coefficients_to`]
+/// gives its own.
+fn write_coefficients_optimized_to(
+    coeffs: &JpegCoefficients,
+    markers: &[SavedMarker],
+    out: &mut dyn FnMut(&[u8]),
+) -> Result<()> {
     use crate::encode::huff_opt;
 
     let num_components: usize = coeffs.components.len();
@@ -1402,8 +1431,8 @@ pub fn write_coefficients_optimized(coeffs: &JpegCoefficients) -> Result<Vec<u8>
 
     bit_writer.flush();
 
-    // === Assemble output ===
-    let mut output: Vec<u8> = Vec::with_capacity(bit_writer.data().len() + 1024);
+    // === Assemble the header; the entropy-coded data follows it in `emit` ===
+    let mut output: Vec<u8> = Vec::with_capacity(1024);
 
     marker_writer::write_soi(&mut output);
     marker_writer::write_app0_jfif_with_density(
@@ -1477,10 +1506,26 @@ pub fn write_coefficients_optimized(coeffs: &JpegCoefficients) -> Result<Vec<u8>
         .collect();
     marker_writer::write_sos(&mut output, &scan_components);
 
-    output.extend_from_slice(bit_writer.data());
-    marker_writer::write_eoi(&mut output);
+    emit(&output, markers, bit_writer.data(), out);
+    Ok(())
+}
 
-    Ok(output)
+/// Gives `out` the file whose header, SOI through SOS, is `header`, with `markers` after its JFIF
+/// segment, then the entropy-coded data `data` and EOI.
+fn emit(header: &[u8], markers: &[SavedMarker], data: &[u8], out: &mut dyn FnMut(&[u8])) {
+    match markers.is_empty() {
+        true => out(header),
+        false => out(&encoder_pipeline::inject_saved_markers(header, markers)),
+    }
+    out(data);
+    out(&[0xFF, 0xD9]);
+}
+
+/// The bytes `write` gives its function, in order.
+fn collected(write: impl FnOnce(&mut dyn FnMut(&[u8])) -> Result<()>) -> Result<Vec<u8>> {
+    let mut file: Vec<u8> = Vec::new();
+    write(&mut |bytes: &[u8]| file.extend_from_slice(bytes))?;
+    Ok(file)
 }
 
 /// Write DCT coefficients as progressive JPEG (SOF2, multi-scan) with
