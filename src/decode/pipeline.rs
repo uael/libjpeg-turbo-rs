@@ -340,20 +340,27 @@ fn pad_alpha_offset(format: PixelFormat) -> Option<usize> {
 }
 
 /// The caller's output destination for one decode: none (`decode_image`),
-/// one buffer of packed rows (`decode_image_into`), or one slice per row
-/// (`decode_image_into_rows`). A terminal branch takes it at most once.
+/// one buffer of packed rows (`decode_image_into`), one slice per row
+/// (`decode_image_into_rows`), or a function each row of `rows` goes to as
+/// it is written (`decode_image_rows`), which needs no output-sized buffer.
+/// A terminal branch takes it at most once.
 enum Sink<'a, 'b> {
     None,
     Whole(&'a mut [u8]),
     Rows(&'a mut [&'b mut [u8]]),
+    Each {
+        each: &'a mut (dyn FnMut(&[u8]) + 'b),
+        rows: core::ops::Range<usize>,
+    },
 }
 
 /// Claim the output destination for a terminal decode branch that
 /// writes packed rows: the caller's buffer when one is armed (validated
 /// against `size`, so a short buffer is a typed error, never a panic or
 /// truncation), else a fresh zero-filled `Vec`. Rows the caller gave
-/// one by one stay armed: the branch writes a `Vec`, which
-/// `decode_image_into_rows` copies.
+/// one by one, or a function of each row, stay armed: the branch writes a
+/// `Vec`, which `decode_image_into_rows` copies, or `decode_image_rows`
+/// hands over row by row.
 fn take_out_buf<'a>(sink: &mut Sink<'a, '_>, size: usize) -> Result<OutBuf<'a>> {
     match core::mem::replace(sink, Sink::None) {
         Sink::Whole(buf) => {
@@ -365,8 +372,8 @@ fn take_out_buf<'a>(sink: &mut Sink<'a, '_>, size: usize) -> Result<OutBuf<'a>> 
             }
             Ok(OutBuf::Borrowed(&mut buf[..size]))
         }
-        Sink::Rows(rows) => {
-            *sink = Sink::Rows(rows);
+        armed @ (Sink::Rows(_) | Sink::Each { .. }) => {
+            *sink = armed;
             Ok(OutBuf::Owned(vec![0u8; size]))
         }
         Sink::None => Ok(OutBuf::Owned(vec![0u8; size])),
@@ -384,15 +391,28 @@ struct OutRows<'a, 'b> {
 enum OutRowsMem<'a, 'b> {
     Packed(OutBuf<'a>),
     Given(&'a mut [&'b mut [u8]]),
+    /// One row, which goes to `each` once written when it is one of `rows`.
+    Each {
+        line: Vec<u8>,
+        each: &'a mut (dyn FnMut(&[u8]) + 'b),
+        rows: core::ops::Range<usize>,
+    },
 }
 
 impl OutRows<'_, '_> {
-    /// Row `y`, exactly `row` bytes.
-    fn row(&mut self, y: usize) -> &mut [u8] {
+    /// Writes row `y`, exactly `row` bytes, with `write`. A branch writes
+    /// its rows top first.
+    fn write(&mut self, y: usize, write: impl FnOnce(&mut [u8])) {
         let row = self.row;
         match &mut self.rows {
-            OutRowsMem::Packed(packed) => &mut packed[y * row..(y + 1) * row],
-            OutRowsMem::Given(rows) => &mut rows[y][..row],
+            OutRowsMem::Packed(packed) => write(&mut packed[y * row..(y + 1) * row]),
+            OutRowsMem::Given(rows) => write(&mut rows[y][..row]),
+            OutRowsMem::Each { line, each, rows } => {
+                write(line);
+                if rows.contains(&y) {
+                    each(line);
+                }
+            }
         }
     }
 
@@ -400,7 +420,7 @@ impl OutRows<'_, '_> {
     fn into_vec(self) -> Vec<u8> {
         match self.rows {
             OutRowsMem::Packed(packed) => packed.into_vec(),
-            OutRowsMem::Given(_) => Vec::new(),
+            OutRowsMem::Given(_) | OutRowsMem::Each { .. } => Vec::new(),
         }
     }
 }
@@ -429,6 +449,11 @@ fn take_out_rows<'a, 'b>(
             }
             OutRowsMem::Given(rows)
         }
+        Sink::Each { each, rows } => OutRowsMem::Each {
+            line: vec![0u8; row],
+            each,
+            rows,
+        },
         armed => {
             *sink = armed;
             OutRowsMem::Packed(take_out_buf(sink, height * row)?)
@@ -4325,6 +4350,51 @@ impl<'a> Decoder<'a> {
         })
     }
 
+    /// Decode, giving each output row to `each` as it is written, top
+    /// first: the rows of [`Self::set_crop_y`] alone when it is set. The
+    /// 3-component YCbCr output paths (4:4:4, 4:2:2, 4:2:0, 4:4:0 and the
+    /// nearest-streamed modes and the full-plane fallback) hold one output
+    /// row, with no output-sized allocation; every other path stages
+    /// through an internal buffer and gives its rows from there, as
+    /// [`Self::decode_image_into_rows`] does. The returned info has no
+    /// pixels.
+    ///
+    /// On error, the rows given before the error are of a failed decode.
+    pub fn decode_image_rows(&self, mut each: impl FnMut(&[u8])) -> Result<ImageInfo> {
+        let rows = match (self.crop_y, self.crop_height) {
+            (Some(y), Some(height)) => y..y.saturating_add(height),
+            _ => 0..usize::MAX,
+        };
+        let mut sink: Sink = Sink::Each {
+            each: &mut each,
+            rows,
+        };
+        let image: Image = self.decode_image_with_sink(&mut sink)?;
+        let sink_consumed: bool = matches!(sink, Sink::None);
+        drop(sink);
+        let row: usize = image.width * image.pixel_format.bytes_per_pixel();
+        if !sink_consumed && row > 0 {
+            for line in image.data.chunks_exact(row) {
+                each(line);
+            }
+        }
+        Ok(ImageInfo {
+            width: image.width,
+            height: image.height,
+            pixel_format: image.pixel_format,
+            precision: image.precision,
+            bytes_written: row * image.height,
+            icc_profile: image.icc_profile,
+            exif_data: image.exif_data,
+            xmp_data: image.xmp_data,
+            iptc_data: image.iptc_data,
+            comment: image.comment,
+            density: image.density,
+            saved_markers: image.saved_markers,
+            warnings: image.warnings,
+        })
+    }
+
     fn decode_image_with_sink(&self, sink: &mut Sink<'_, '_>) -> Result<Image> {
         let mut image: Image = self.decode_image_inner(sink)?;
         if !self.marker_processors.is_empty() {
@@ -4365,22 +4435,19 @@ impl<'a> Decoder<'a> {
             let offset: usize = cy.min(image.height);
             let height: usize = ch.min(image.height.saturating_sub(offset));
             if offset > 0 || height < image.height {
-                // A sink-claimed decode returns empty data; vertical crop
-                // is excluded from sink mode in decode_image_into, so this
-                // is unreachable — keep it panic-free if that invariant
-                // ever breaks rather than indexing out of range.
-                debug_assert!(
-                    !image.data.is_empty(),
-                    "vertical crop cannot apply to a sink-claimed decode"
-                );
+                // A sink-claimed decode returns empty data. Only a decode
+                // whose rows went to a function claims its sink under a
+                // vertical crop, and that function was given the rows of the
+                // crop alone; decode_image_into and decode_image_into_rows
+                // stage a cropped decode.
                 if !image.data.is_empty() {
                     let bpp: usize = image.pixel_format.bytes_per_pixel();
                     let row_bytes: usize = image.width * bpp;
                     let start: usize = offset * row_bytes;
                     let end: usize = start + height * row_bytes;
                     image.data = image.data[start..end].to_vec();
-                    image.height = height;
                 }
+                image.height = height;
             }
         }
         Ok(image)
@@ -5375,26 +5442,30 @@ impl<'a> Decoder<'a> {
                         let out_y_bot = cy * 2 + 1;
                         let y_off: usize = comp_x_offsets[0];
                         if out_y_top < out_height {
-                            self.color_convert_row(
-                                out_format,
-                                &y_plane[out_y_top * y_width + y_off..],
-                                &cb_row_top,
-                                &cr_row_top,
-                                data.row(out_y_top),
-                                out_width,
-                                out_y_top,
-                            );
+                            data.write(out_y_top, |row| {
+                                self.color_convert_row(
+                                    out_format,
+                                    &y_plane[out_y_top * y_width + y_off..],
+                                    &cb_row_top,
+                                    &cr_row_top,
+                                    row,
+                                    out_width,
+                                    out_y_top,
+                                );
+                            });
                         }
                         if out_y_bot < out_height {
-                            self.color_convert_row(
-                                out_format,
-                                &y_plane[out_y_bot * y_width + y_off..],
-                                &cb_row_bot,
-                                &cr_row_bot,
-                                data.row(out_y_bot),
-                                out_width,
-                                out_y_bot,
-                            );
+                            data.write(out_y_bot, |row| {
+                                self.color_convert_row(
+                                    out_format,
+                                    &y_plane[out_y_bot * y_width + y_off..],
+                                    &cb_row_bot,
+                                    &cr_row_bot,
+                                    row,
+                                    out_width,
+                                    out_y_bot,
+                                );
+                            });
                         }
                     }
 
@@ -5461,15 +5532,17 @@ impl<'a> Decoder<'a> {
                             [y * cb_w + cr_off..y * cb_w + cr_off + actual_cb_w];
                         self.fancy_upsample_h2v1(cb_src, actual_cb_w, &mut cb_row);
                         self.fancy_upsample_h2v1(cr_src, actual_cb_w, &mut cr_row);
-                        self.color_convert_row(
-                            out_format,
-                            &y_plane[y * y_width + y_off..],
-                            &cb_row,
-                            &cr_row,
-                            data.row(y),
-                            out_width,
-                            y,
-                        );
+                        data.write(y, |row| {
+                            self.color_convert_row(
+                                out_format,
+                                &y_plane[y * y_width + y_off..],
+                                &cb_row,
+                                &cr_row,
+                                row,
+                                out_width,
+                                y,
+                            );
+                        });
                     }
 
                     return Ok(Image {
@@ -5539,15 +5612,17 @@ impl<'a> Decoder<'a> {
                             let cr_adj = &component_planes[2][row_range(adj_idx, cr_off)];
                             Self::fancy_h1v2_row(cb_cur, cb_adj, &mut cb_row, actual_cb_w, bias);
                             Self::fancy_h1v2_row(cr_cur, cr_adj, &mut cr_row, actual_cb_w, bias);
-                            self.color_convert_row(
-                                out_format,
-                                &y_plane[out_y * y_width + y_off..],
-                                &cb_row,
-                                &cr_row,
-                                data.row(out_y),
-                                out_width,
-                                out_y,
-                            );
+                            data.write(out_y, |row| {
+                                self.color_convert_row(
+                                    out_format,
+                                    &y_plane[out_y * y_width + y_off..],
+                                    &cb_row,
+                                    &cr_row,
+                                    row,
+                                    out_width,
+                                    out_y,
+                                );
+                            });
                         }
                     }
 
@@ -5664,15 +5739,17 @@ impl<'a> Decoder<'a> {
                             );
                             last_cr_src = cr_src_y;
                         }
-                        self.color_convert_row(
-                            out_format,
-                            &y_plane[y * y_width + y_off..],
-                            &cb_row,
-                            &cr_row,
-                            data.row(y),
-                            out_width,
-                            y,
-                        );
+                        data.write(y, |row| {
+                            self.color_convert_row(
+                                out_format,
+                                &y_plane[y * y_width + y_off..],
+                                &cb_row,
+                                &cr_row,
+                                row,
+                                out_width,
+                                y,
+                            );
+                        });
                     }
 
                     return Ok(Image {
@@ -5826,15 +5903,17 @@ impl<'a> Decoder<'a> {
                 // Actually, let's just do the color conversion here and return.
                 let mut data = take_out_rows(sink, out_height, out_width * bpp)?;
                 for y in 0..out_height {
-                    self.color_convert_row(
-                        out_format,
-                        &y_plane[y * y_width + comp_x_offsets[0]..],
-                        &cb_full[y * full_width..],
-                        &cr_full[y * full_width..],
-                        data.row(y),
-                        out_width,
-                        y,
-                    );
+                    data.write(y, |row| {
+                        self.color_convert_row(
+                            out_format,
+                            &y_plane[y * y_width + comp_x_offsets[0]..],
+                            &cb_full[y * full_width..],
+                            &cr_full[y * full_width..],
+                            row,
+                            out_width,
+                            y,
+                        );
+                    });
                 }
 
                 return Ok(Image {
@@ -5857,15 +5936,17 @@ impl<'a> Decoder<'a> {
             // 4:4:4 path (no upsampling)
             let mut data = take_out_rows(sink, out_height, out_width * bpp)?;
             for y in 0..out_height {
-                self.color_convert_row(
-                    out_format,
-                    &y_plane[y * y_width + comp_x_offsets[0]..],
-                    &cb_data[y * cb_stride + comp_x_offsets[1]..],
-                    &cr_data[y * cr_stride + comp_x_offsets[2]..],
-                    data.row(y),
-                    out_width,
-                    y,
-                );
+                data.write(y, |row| {
+                    self.color_convert_row(
+                        out_format,
+                        &y_plane[y * y_width + comp_x_offsets[0]..],
+                        &cb_data[y * cb_stride + comp_x_offsets[1]..],
+                        &cr_data[y * cr_stride + comp_x_offsets[2]..],
+                        row,
+                        out_width,
+                        y,
+                    );
+                });
             }
 
             Ok(Image {
