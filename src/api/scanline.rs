@@ -5,11 +5,13 @@
 /// read interface. Internally it performs a lazy full decode on first access, then
 /// serves individual rows from the decoded buffer.
 ///
-/// `ScanlineEncoder` accumulates pixel rows one at a time, then delegates to the
-/// existing compression pipeline on `finish()`.
+/// `ScanlineEncoder` codes RGB, RGBA, BGR and BGRA rows an MCU row at a time as they
+/// come, through `RowEncoder`; it accumulates rows of any other format, then
+/// delegates to the existing compression pipeline on `finish()`.
 use crate::common::error::{JpegError, Result};
 use crate::common::types::{ColorSpace, DctMethod, FrameHeader, PixelFormat, Subsampling};
 use crate::decode::pipeline::{Decoder, Image};
+use crate::encode::pipeline::{CompressParams, RowEncoder};
 #[allow(unused_imports)]
 use alloc::vec::Vec;
 #[allow(unused_imports)]
@@ -195,74 +197,124 @@ impl<'a> ScanlineDecoder<'a> {
 
 /// Row-by-row JPEG encoder.
 pub struct ScanlineEncoder {
-    pixels: Vec<u8>,
     width: usize,
     height: usize,
     pixel_format: PixelFormat,
     quality: u8,
     subsampling: Subsampling,
-    current_line: usize,
+    rows: Rows,
+}
+
+/// The rows a [`ScanlineEncoder`] took: none yet, so its settings can still change, coded as they
+/// come, or kept whole for a format the row encode does not take.
+enum Rows {
+    Waiting,
+    Coded(RowEncoder),
+    Kept {
+        pixels: Vec<u8>,
+        current_line: usize,
+    },
 }
 
 impl ScanlineEncoder {
     /// Create a new scanline encoder.
     pub fn new(width: usize, height: usize, pixel_format: PixelFormat) -> Self {
-        let bpp: usize = pixel_format.bytes_per_pixel();
         Self {
-            pixels: vec![0u8; width * height * bpp],
             width,
             height,
             pixel_format,
             quality: 75,
             subsampling: Subsampling::S420,
-            current_line: 0,
+            rows: Rows::Waiting,
         }
     }
 
-    /// Set JPEG quality factor (1-100).
+    /// Set JPEG quality factor (1-100). It takes effect when no row was written yet.
     pub fn set_quality(&mut self, quality: u8) {
         self.quality = quality;
     }
 
-    /// Set chroma subsampling mode.
+    /// Set chroma subsampling mode. It takes effect when no row was written yet.
     pub fn set_subsampling(&mut self, subsampling: Subsampling) {
         self.subsampling = subsampling;
     }
 
     /// Returns the index of the next scanline to be written.
     pub fn next_scanline(&self) -> usize {
-        self.current_line
+        match &self.rows {
+            Rows::Waiting => 0,
+            Rows::Coded(encoder) => encoder.rows(),
+            Rows::Kept { current_line, .. } => *current_line,
+        }
     }
 
     /// Write one row of pixel data.
     pub fn write_scanline(&mut self, row: &[u8]) -> Result<()> {
-        if self.current_line >= self.height {
-            return Err(JpegError::Unsupported("all scanlines written".into()));
+        if let Rows::Waiting = self.rows {
+            let params = CompressParams::new(
+                &[],
+                self.width,
+                self.height,
+                self.pixel_format,
+                self.quality,
+                self.subsampling,
+            )
+            .dct_method(DctMethod::IsLow);
+            self.rows = match RowEncoder::new(&params)? {
+                Some(encoder) => Rows::Coded(encoder),
+                None => Rows::Kept {
+                    pixels: vec![
+                        0u8;
+                        self.width * self.height * self.pixel_format.bytes_per_pixel()
+                    ],
+                    current_line: 0,
+                },
+            };
         }
-        let bpp: usize = self.pixel_format.bytes_per_pixel();
-        let row_bytes: usize = self.width * bpp;
-        let start: usize = self.current_line * row_bytes;
-        self.pixels[start..start + row_bytes].copy_from_slice(&row[..row_bytes]);
-        self.current_line += 1;
-        Ok(())
+        match &mut self.rows {
+            Rows::Waiting => Err(JpegError::Unsupported("the rows did not start".into())),
+            Rows::Coded(encoder) => encoder.write_row(row),
+            Rows::Kept {
+                pixels,
+                current_line,
+            } => {
+                if *current_line >= self.height {
+                    return Err(JpegError::Unsupported("all scanlines written".into()));
+                }
+                let bpp: usize = self.pixel_format.bytes_per_pixel();
+                let row_bytes: usize = self.width * bpp;
+                let start: usize = *current_line * row_bytes;
+                pixels[start..start + row_bytes].copy_from_slice(&row[..row_bytes]);
+                *current_line += 1;
+                Ok(())
+            }
+        }
     }
 
     /// Compress all accumulated scanlines into a JPEG byte stream.
     pub fn finish(self) -> Result<Vec<u8>> {
-        if self.current_line != self.height {
-            return Err(JpegError::Unsupported(format!(
+        match self.rows {
+            Rows::Coded(encoder) => encoder.finish(),
+            Rows::Kept {
+                pixels,
+                current_line,
+            } if current_line == self.height => crate::encode::pipeline::compress(
+                &pixels,
+                self.width,
+                self.height,
+                self.pixel_format,
+                self.quality,
+                self.subsampling,
+                DctMethod::IsLow,
+            ),
+            rows => Err(JpegError::Unsupported(format!(
                 "not all scanlines written: {} of {}",
-                self.current_line, self.height
-            )));
+                match rows {
+                    Rows::Kept { current_line, .. } => current_line,
+                    _ => 0,
+                },
+                self.height
+            ))),
         }
-        crate::encode::pipeline::compress(
-            &self.pixels,
-            self.width,
-            self.height,
-            self.pixel_format,
-            self.quality,
-            self.subsampling,
-            crate::common::types::DctMethod::IsLow,
-        )
     }
 }

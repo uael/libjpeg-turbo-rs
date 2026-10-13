@@ -349,16 +349,9 @@ pub fn compress_with_params(params: &CompressParams<'_>) -> Result<Vec<u8>> {
         width,
         height,
         pixel_format,
-        quality,
-        subsampling,
-        dct_method,
-        restart_interval,
-        custom_quant,
-        custom_dc_huffman,
-        custom_ac_huffman,
         optimize_huffman,
         smoothing_factor,
-        pitch: _,
+        ..
     } = *params;
 
     // Two-pass optimized Huffman, and smoothing, both need full-plane
@@ -369,18 +362,7 @@ pub fn compress_with_params(params: &CompressParams<'_>) -> Result<Vec<u8>> {
         return compress_optimized_with_params(params);
     }
 
-    // Validate inputs
-    if width == 0 || height == 0 {
-        return Err(JpegError::CorruptData(
-            "image dimensions must be non-zero".to_string(),
-        ));
-    }
-    if width > 65535 || height > 65535 {
-        return Err(JpegError::CorruptData(format!(
-            "JPEG dimensions must be <= 65535, got {}x{}",
-            width, height
-        )));
-    }
+    check_dimensions(width, height)?;
 
     let bpp = pixel_format.bytes_per_pixel();
     let pitch = params.row_pitch();
@@ -409,718 +391,946 @@ pub fn compress_with_params(params: &CompressParams<'_>) -> Result<Vec<u8>> {
         return compress_cmyk(params);
     }
 
-    let is_grayscale = pixel_format == PixelFormat::Grayscale;
-
-    // Quantization tables: a custom slot wins, otherwise scale Annex K by quality.
-    let luma_quant: [u16; 64] = match custom_quant.and_then(|tables| tables[0]) {
-        Some(table) => table,
-        None => tables::quality_scale_quant_table(&tables::STD_LUMINANCE_QUANT_TABLE, quality),
-    };
-    let chroma_quant: [u16; 64] = match custom_quant.and_then(|tables| tables[1]) {
-        Some(table) => table,
-        None => tables::quality_scale_quant_table(&tables::STD_CHROMINANCE_QUANT_TABLE, quality),
-    };
-
-    // Divisor tables scale quant values for the chosen FDCT method.
-    // IsLow: multiply by 8 (islow leaves factor-of-8 in output).
-    // IsFast: multiply by AA&N scale factors (ifast_raw leaves AA&N-scaled output).
-    let luma_divisors = if dct_method == DctMethod::IsFast {
-        scale_quant_for_ifast(&luma_quant)
-    } else {
-        scale_quant_for_fdct(&luma_quant)
-    };
-    let chroma_divisors = if dct_method == DctMethod::IsFast {
-        scale_quant_for_ifast(&chroma_quant)
-    } else {
-        scale_quant_for_fdct(&chroma_quant)
-    };
-
-    // Huffman tables: custom slots win, otherwise Annex K. Destructured so the
-    // encoding tables keep the names the MCU loops already use, and so the
-    // bits/values that go into the DHT markers travel with them.
-    let ResolvedHuffman {
-        dc_luma: dc_luma_table,
-        ac_luma: ac_luma_table,
-        dc_chroma: dc_chroma_table,
-        ac_chroma: ac_chroma_table,
-        dc_luma_bits,
-        dc_luma_values,
-        ac_luma_bits,
-        ac_luma_values,
-        dc_chroma_bits,
-        dc_chroma_values,
-        ac_chroma_bits,
-        ac_chroma_values,
-    } = ResolvedHuffman::resolve(custom_dc_huffman, custom_ac_huffman);
-
-    // SIMD dispatch — used for both color conversion and FDCT+quantize
-    let enc_simd = crate::simd::detect_encoder();
-
-    // Determine MCU dimensions based on subsampling
-    let (mcu_w, mcu_h) = if is_grayscale {
-        (8, 8)
-    } else {
-        match subsampling {
-            Subsampling::S444 | Subsampling::Unknown => (8, 8),
-            Subsampling::S422 => (16, 8),
-            Subsampling::S420 => (16, 16),
-            Subsampling::S440 => (8, 16),
-            Subsampling::S411 => (32, 8),
-            Subsampling::S441 => (8, 32),
-            Subsampling::S410 => (32, 16),
-            Subsampling::S24 => (16, 32),
+    if let Some(mut rows) = RowEncoder::new(params)? {
+        for y in 0..height {
+            rows.write_row(&pixels[y * pitch..y * pitch + width * bpp])?;
         }
-    };
-
-    let mcus_x: usize = width.div_ceil(mcu_w);
-    let mcus_y: usize = height.div_ceil(mcu_h);
-
-    // Dispatch FDCT+quantize based on DCT method.
-    let fdct_quantize_fn: fn(&mut [i16; 64], &QuantDivisors, &mut [i16; 64]) = match dct_method {
-        DctMethod::IsLow => enc_simd.fdct_quantize,
-        DctMethod::IsFast => crate::simd::scalar::scalar_fdct_ifast_quantize,
-        DctMethod::Float => crate::simd::scalar::scalar_fdct_float_quantize,
-    };
-
-    // Entropy encode all MCUs
-    let mut bit_writer = BitWriter::new(width * height);
-    let mut prev_dc_y: i16 = 0;
-    let mut prev_dc_cb: i16 = 0;
-    let mut prev_dc_cr: i16 = 0;
-
-    // Restart state, shared by both encode strategies below. `mcu_count` runs
-    // across MCU rows, so a restart can fall anywhere inside a row.
-    let restart_mcu_interval: u32 = restart_interval as u32;
-    let mut mcu_count: u32 = 0;
-    let mut restart_marker_index: u8 = 0;
-
-    /// Emit an RST marker and reset the DC predictors when the MCU index lands
-    /// on an interval boundary. Never fires before the first MCU.
-    macro_rules! maybe_emit_restart {
-        () => {
-            if restart_mcu_interval > 0
-                && mcu_count > 0
-                && mcu_count.is_multiple_of(restart_mcu_interval)
-            {
-                bit_writer.flush_restart();
-                bit_writer.write_restart_marker(restart_marker_index);
-                restart_marker_index = restart_marker_index.wrapping_add(1);
-                prev_dc_y = 0;
-                prev_dc_cb = 0;
-                prev_dc_cr = 0;
-            }
-        };
+        return rows.finish();
     }
 
-    // Single-pass fused approach: convert MCU rows on-the-fly instead
-    // of pre-allocating full-size planes. Keeps data in L1/L2 cache between
-    // color conversion and encoding.
-    // Select format-specific color conversion function + BPP for the fast path.
-    let fused_color_fn: Option<(ColorConvertRowFn, usize)> = if is_grayscale {
-        None
-    } else {
-        match pixel_format {
-            PixelFormat::Rgb => Some((enc_simd.rgb_to_ycbcr_row, 3)),
-            PixelFormat::Rgba => Some((select_rgba_to_ycbcr_fn(), 4)),
-            PixelFormat::Bgr => Some((select_bgr_to_ycbcr_fn(), 3)),
-            PixelFormat::Bgra => Some((select_bgra_to_ycbcr_fn(), 4)),
-            _ => None,
+    params.packed()?;
+    let mut single = Single::new(params);
+    let Single {
+        is_grayscale,
+        subsampling,
+        mcu_w,
+        mcu_h,
+        mcus_x,
+        mcus_y,
+        ..
+    } = single;
+    // Fallback: full-plane color conversion for non-RGB formats and grayscale
+    let (y_plane, cb_plane, cr_plane) =
+        convert_to_ycbcr(pixels, width, height, pixel_format, single.rgb_to_ycbcr_row)?;
+
+    // Pad all planes to MCU-aligned dimensions so all blocks (including edge
+    // blocks) go through the NEON fused FDCT+quantize path instead of the
+    // scalar fallback.  This matches C libjpeg-turbo's expand_right_edge
+    // behavior and ensures byte-identical output.
+    let padded_w: usize = mcus_x * mcu_w;
+    let padded_h: usize = mcus_y * mcu_h;
+
+    fn pad_plane(plane: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u8> {
+        if src_w == dst_w && src_h == dst_h {
+            return plane.to_vec();
         }
-    };
-    if let Some((color_convert_fn, bpp)) = fused_color_fn {
+        let mut padded: Vec<u8> = vec![0u8; dst_w * dst_h];
+        for row in 0..src_h {
+            let src_start: usize = row * src_w;
+            let dst_start: usize = row * dst_w;
+            padded[dst_start..dst_start + src_w]
+                .copy_from_slice(&plane[src_start..src_start + src_w]);
+            if src_w < dst_w {
+                let last_val: u8 = plane[src_start + src_w - 1];
+                for x in src_w..dst_w {
+                    padded[dst_start + x] = last_val;
+                }
+            }
+        }
+        if src_h < dst_h {
+            let last_row: Vec<u8> = padded[(src_h - 1) * dst_w..src_h * dst_w].to_vec();
+            for row in src_h..dst_h {
+                let dst_start: usize = row * dst_w;
+                padded[dst_start..dst_start + dst_w].copy_from_slice(&last_row);
+            }
+        }
+        padded
+    }
+
+    /// Pad a chroma plane using row-group replication to match C libjpeg-turbo's
+    /// two-phase approach (jcprepct.c + jccoefct.c).
+    fn pad_chroma_plane(
+        plane: &[u8],
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+        max_v: usize,
+    ) -> Vec<u8> {
+        if src_w == dst_w && src_h == dst_h {
+            return plane.to_vec();
+        }
+        let mut padded: Vec<u8> = vec![0u8; dst_w * dst_h];
+        for row in 0..src_h {
+            let src_start: usize = row * src_w;
+            let dst_start: usize = row * dst_w;
+            padded[dst_start..dst_start + src_w]
+                .copy_from_slice(&plane[src_start..src_start + src_w]);
+            if src_w < dst_w {
+                let last_val: u8 = plane[src_start + src_w - 1];
+                for x in src_w..dst_w {
+                    padded[dst_start + x] = last_val;
+                }
+            }
+        }
+        if src_h < dst_h {
+            let row_group_end: usize = src_h.div_ceil(max_v).min(dst_h / max_v) * max_v;
+            let last_row: Vec<u8> = padded[(src_h - 1) * dst_w..src_h * dst_w].to_vec();
+            // Phase 1: pad to row group boundary
+            for row in src_h..row_group_end.min(dst_h) {
+                let dst_start: usize = row * dst_w;
+                padded[dst_start..dst_start + dst_w].copy_from_slice(&last_row);
+            }
+            // Phase 2: replicate last complete row group
+            if row_group_end < dst_h {
+                let group_start: usize = row_group_end - max_v;
+                for row in row_group_end..dst_h {
+                    let src_row: usize = group_start + (row - row_group_end) % max_v;
+                    let dst_start: usize = row * dst_w;
+                    let src_start: usize = src_row * dst_w;
+                    let src_data: Vec<u8> = padded[src_start..src_start + dst_w].to_vec();
+                    padded[dst_start..dst_start + dst_w].copy_from_slice(&src_data);
+                }
+            }
+        }
+        padded
+    }
+
+    let (_, v_samp) = subsampling.sampling_factors();
+    let fb_max_v: usize = v_samp as usize;
+    let y_plane_padded: Vec<u8> = pad_plane(&y_plane, width, height, padded_w, padded_h);
+    let cb_plane_padded: Vec<u8> =
+        pad_chroma_plane(&cb_plane, width, height, padded_w, padded_h, fb_max_v);
+    let cr_plane_padded: Vec<u8> =
+        pad_chroma_plane(&cr_plane, width, height, padded_w, padded_h, fb_max_v);
+
+    let Single { tables, coder, .. } = &mut single;
+    for mcu_row in 0..mcus_y {
+        for mcu_col in 0..mcus_x {
+            coder.restart();
+
+            let x0: usize = mcu_col * mcu_w;
+            let y0: usize = mcu_row * mcu_h;
+
+            if is_grayscale {
+                encode_single_block(
+                    &y_plane_padded,
+                    padded_w,
+                    padded_h,
+                    x0,
+                    y0,
+                    &tables.luma_divisors,
+                    &tables.huffman.dc_luma,
+                    &tables.huffman.ac_luma,
+                    &mut coder.bit_writer,
+                    &mut coder.prev_dc_y,
+                    tables.fdct_quantize_fn,
+                );
+            } else {
+                encode_color_mcu(
+                    &y_plane_padded,
+                    &cb_plane_padded,
+                    &cr_plane_padded,
+                    padded_w,
+                    padded_h,
+                    x0,
+                    y0,
+                    subsampling,
+                    &tables.luma_divisors,
+                    &tables.chroma_divisors,
+                    &tables.huffman.dc_luma,
+                    &tables.huffman.ac_luma,
+                    &tables.huffman.dc_chroma,
+                    &tables.huffman.ac_chroma,
+                    &mut coder.bit_writer,
+                    &mut coder.prev_dc_y,
+                    &mut coder.prev_dc_cb,
+                    &mut coder.prev_dc_cr,
+                    tables.fdct_quantize_fn,
+                );
+            }
+
+            coder.mcu_count += 1;
+        }
+    }
+    Ok(single.finish())
+}
+
+/// The sides a baseline encode takes: from 1 to 65535 samples.
+fn check_dimensions(width: usize, height: usize) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Err(JpegError::CorruptData(
+            "image dimensions must be non-zero".to_string(),
+        ));
+    }
+    if width > 65535 || height > 65535 {
+        return Err(JpegError::CorruptData(format!(
+            "JPEG dimensions must be <= 65535, got {}x{}",
+            width, height
+        )));
+    }
+    Ok(())
+}
+
+/// The tables of a single-pass baseline encode.
+struct Tables {
+    luma_quant: [u16; 64],
+    chroma_quant: [u16; 64],
+    luma_divisors: QuantDivisors,
+    chroma_divisors: QuantDivisors,
+    huffman: ResolvedHuffman,
+    fdct_quantize_fn: fn(&mut [i16; 64], &QuantDivisors, &mut [i16; 64]),
+}
+
+/// The entropy coder of a single-pass baseline encode, and where it is in the scan.
+struct Coder {
+    bit_writer: BitWriter,
+    prev_dc_y: i16,
+    prev_dc_cb: i16,
+    prev_dc_cr: i16,
+    /// MCUs coded so far. It runs across MCU rows, so a restart can fall anywhere inside a row.
+    mcu_count: u32,
+    restart_mcu_interval: u32,
+    restart_marker_index: u8,
+}
+
+impl Coder {
+    /// Emit an RST marker and reset the DC predictors when the MCU index lands
+    /// on an interval boundary. Never fires before the first MCU.
+    fn restart(&mut self) {
+        if self.restart_mcu_interval > 0
+            && self.mcu_count > 0
+            && self.mcu_count.is_multiple_of(self.restart_mcu_interval)
+        {
+            self.bit_writer.flush_restart();
+            self.bit_writer
+                .write_restart_marker(self.restart_marker_index);
+            self.restart_marker_index = self.restart_marker_index.wrapping_add(1);
+            self.prev_dc_y = 0;
+            self.prev_dc_cb = 0;
+            self.prev_dc_cr = 0;
+        }
+    }
+}
+
+/// A single-pass baseline encode of a picture of samples of one or three components: its
+/// geometry, its tables and its coder. Its MCUs are coded by the fused row path
+/// ([`RowEncoder`]) or by the full-plane path of [`compress_with_params`], and
+/// [`Single::finish`] writes the file around them.
+struct Single {
+    width: usize,
+    height: usize,
+    subsampling: Subsampling,
+    restart_interval: u16,
+    is_grayscale: bool,
+    mcu_w: usize,
+    mcu_h: usize,
+    mcus_x: usize,
+    mcus_y: usize,
+    rgb_to_ycbcr_row: ColorConvertRowFn,
+    tables: Tables,
+    coder: Coder,
+}
+
+impl Single {
+    /// The encode `params` sets, which reads none of its `pixels`.
+    fn new(params: &CompressParams<'_>) -> Self {
+        let CompressParams {
+            width,
+            height,
+            pixel_format,
+            quality,
+            subsampling,
+            dct_method,
+            restart_interval,
+            custom_quant,
+            custom_dc_huffman,
+            custom_ac_huffman,
+            ..
+        } = *params;
+        let is_grayscale = pixel_format == PixelFormat::Grayscale;
+
+        // Quantization tables: a custom slot wins, otherwise scale Annex K by quality.
+        let luma_quant: [u16; 64] = match custom_quant.and_then(|tables| tables[0]) {
+            Some(table) => table,
+            None => tables::quality_scale_quant_table(&tables::STD_LUMINANCE_QUANT_TABLE, quality),
+        };
+        let chroma_quant: [u16; 64] = match custom_quant.and_then(|tables| tables[1]) {
+            Some(table) => table,
+            None => {
+                tables::quality_scale_quant_table(&tables::STD_CHROMINANCE_QUANT_TABLE, quality)
+            }
+        };
+
+        // Divisor tables scale quant values for the chosen FDCT method.
+        // IsLow: multiply by 8 (islow leaves factor-of-8 in output).
+        // IsFast: multiply by AA&N scale factors (ifast_raw leaves AA&N-scaled output).
+        let luma_divisors = if dct_method == DctMethod::IsFast {
+            scale_quant_for_ifast(&luma_quant)
+        } else {
+            scale_quant_for_fdct(&luma_quant)
+        };
+        let chroma_divisors = if dct_method == DctMethod::IsFast {
+            scale_quant_for_ifast(&chroma_quant)
+        } else {
+            scale_quant_for_fdct(&chroma_quant)
+        };
+
+        // Huffman tables: custom slots win, otherwise Annex K. The bits/values
+        // that go into the DHT markers travel with the encoding tables.
+        let huffman = ResolvedHuffman::resolve(custom_dc_huffman, custom_ac_huffman);
+
+        // SIMD dispatch — used for both color conversion and FDCT+quantize
+        let enc_simd = crate::simd::detect_encoder();
+
+        // Determine MCU dimensions based on subsampling
+        let (mcu_w, mcu_h) = if is_grayscale {
+            (8, 8)
+        } else {
+            match subsampling {
+                Subsampling::S444 | Subsampling::Unknown => (8, 8),
+                Subsampling::S422 => (16, 8),
+                Subsampling::S420 => (16, 16),
+                Subsampling::S440 => (8, 16),
+                Subsampling::S411 => (32, 8),
+                Subsampling::S441 => (8, 32),
+                Subsampling::S410 => (32, 16),
+                Subsampling::S24 => (16, 32),
+            }
+        };
+
+        // Dispatch FDCT+quantize based on DCT method.
+        let fdct_quantize_fn: fn(&mut [i16; 64], &QuantDivisors, &mut [i16; 64]) = match dct_method
+        {
+            DctMethod::IsLow => enc_simd.fdct_quantize,
+            DctMethod::IsFast => crate::simd::scalar::scalar_fdct_ifast_quantize,
+            DctMethod::Float => crate::simd::scalar::scalar_fdct_float_quantize,
+        };
+
+        Self {
+            width,
+            height,
+            subsampling,
+            restart_interval,
+            is_grayscale,
+            mcu_w,
+            mcu_h,
+            mcus_x: width.div_ceil(mcu_w),
+            mcus_y: height.div_ceil(mcu_h),
+            rgb_to_ycbcr_row: enc_simd.rgb_to_ycbcr_row,
+            tables: Tables {
+                luma_quant,
+                chroma_quant,
+                luma_divisors,
+                chroma_divisors,
+                huffman,
+                fdct_quantize_fn,
+            },
+            coder: Coder {
+                bit_writer: BitWriter::new(width * height),
+                prev_dc_y: 0,
+                prev_dc_cb: 0,
+                prev_dc_cr: 0,
+                mcu_count: 0,
+                restart_mcu_interval: u32::from(restart_interval),
+                restart_marker_index: 0,
+            },
+        }
+    }
+
+    /// The file: its markers, the coded MCUs and EOI.
+    fn finish(mut self) -> Vec<u8> {
+        let Self {
+            width,
+            height,
+            subsampling,
+            restart_interval,
+            is_grayscale,
+            ref tables,
+            ref mut coder,
+            ..
+        } = self;
+        let Tables {
+            luma_quant,
+            chroma_quant,
+            huffman,
+            ..
+        } = tables;
+        coder.bit_writer.flush();
+
+        // Assemble output: markers + entropy data + EOI
+        let mut output = Vec::with_capacity(coder.bit_writer.data().len() + 1024);
+
+        marker_writer::write_soi(&mut output);
+        marker_writer::write_app0_jfif(&mut output);
+
+        // Quantization tables
+        marker_writer::write_dqt(&mut output, 0, luma_quant);
+        if !is_grayscale {
+            marker_writer::write_dqt(&mut output, 1, chroma_quant);
+        }
+
+        // Frame header. A quantization value above 255 needs 16-bit DQT entries,
+        // which baseline (SOF0) forbids, so those streams are extended sequential
+        // (SOF1). Only reachable through custom quant tables — the quality-scaled
+        // Annex K tables clamp at 255.
+        let needs_sof1: bool = luma_quant.iter().any(|&value| value > 255)
+            || (!is_grayscale && chroma_quant.iter().any(|&value| value > 255));
+        let write_frame_header = if needs_sof1 {
+            marker_writer::write_sof1
+        } else {
+            marker_writer::write_sof0
+        };
+        if is_grayscale {
+            let components = vec![(1, 1, 1, 0)];
+            write_frame_header(&mut output, width as u16, height as u16, &components);
+        } else {
+            let (h_samp, v_samp) = subsampling.sampling_factors();
+            let components = vec![
+                (1, h_samp, v_samp, 0), // Y
+                (2, 1, 1, 1),           // Cb
+                (3, 1, 1, 1),           // Cr
+            ];
+            write_frame_header(&mut output, width as u16, height as u16, &components);
+        }
+
+        // Huffman tables — the same bits/values the encoding tables were built from.
+        marker_writer::write_dht(
+            &mut output,
+            0,
+            0,
+            &huffman.dc_luma_bits,
+            &huffman.dc_luma_values,
+        );
+        marker_writer::write_dht(
+            &mut output,
+            1,
+            0,
+            &huffman.ac_luma_bits,
+            &huffman.ac_luma_values,
+        );
+        if !is_grayscale {
+            marker_writer::write_dht(
+                &mut output,
+                0,
+                1,
+                &huffman.dc_chroma_bits,
+                &huffman.dc_chroma_values,
+            );
+            marker_writer::write_dht(
+                &mut output,
+                1,
+                1,
+                &huffman.ac_chroma_bits,
+                &huffman.ac_chroma_values,
+            );
+        }
+
+        // Restart interval. Omitted entirely when zero, matching C.
+        if restart_interval > 0 {
+            marker_writer::write_dri(&mut output, restart_interval);
+        }
+
+        // Scan header
+        if is_grayscale {
+            let scan_components = vec![(1, 0, 0)];
+            marker_writer::write_sos(&mut output, &scan_components);
+        } else {
+            let scan_components = vec![
+                (1, 0, 0), // Y: DC table 0, AC table 0
+                (2, 1, 1), // Cb: DC table 1, AC table 1
+                (3, 1, 1), // Cr: DC table 1, AC table 1
+            ];
+            marker_writer::write_sos(&mut output, &scan_components);
+        }
+
+        // Entropy-coded data
+        output.extend_from_slice(coder.bit_writer.data());
+
+        marker_writer::write_eoi(&mut output);
+
+        output
+    }
+}
+
+/// A single-pass baseline encode of RGB, RGBA, BGR or BGRA samples that takes its rows one at a
+/// time, top first, and codes each MCU row once it holds that row's samples: it holds an MCU row
+/// of samples, never the picture. It writes the bytes [`compress_with_params`] writes for the same
+/// rows and settings.
+pub struct RowEncoder {
+    single: Single,
+    color_convert_fn: ColorConvertRowFn,
+    bpp: usize,
+    y_buf: Vec<u8>,
+    cb_buf: Vec<u8>,
+    cr_buf: Vec<u8>,
+    /// Half-resolution chroma for the AVX2 4:2:0 path: after color conversion, full-res Cb/Cr
+    /// are downsampled into these compact buffers so that FDCT reads from stride=half_w instead
+    /// of stride=padded_w.
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    use_avx2_420: bool,
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    cb_half: Vec<u8>,
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    cr_half: Vec<u8>,
+    /// The rows written so far.
+    rows: usize,
+}
+
+impl RowEncoder {
+    /// The encode `params` sets, of the rows [`write_row`](Self::write_row) takes rather than
+    /// its `pixels`, when it is a single-pass encode of RGB, RGBA, BGR or BGRA samples: none for
+    /// any other format, and none for an optimized-Huffman or smoothed encode, which reads the
+    /// whole picture.
+    pub fn new(params: &CompressParams<'_>) -> Result<Option<Self>> {
+        if params.optimize_huffman || params.smoothing_factor > 0 {
+            return Ok(None);
+        }
+        check_dimensions(params.width, params.height)?;
+        let single = Single::new(params);
+        // Single-pass fused approach: convert MCU rows on-the-fly instead
+        // of pre-allocating full-size planes. Keeps data in L1/L2 cache between
+        // color conversion and encoding.
+        // Select format-specific color conversion function + BPP for the fast path.
+        let (color_convert_fn, bpp): (ColorConvertRowFn, usize) = match params.pixel_format {
+            PixelFormat::Rgb => (single.rgb_to_ycbcr_row, 3),
+            PixelFormat::Rgba => (select_rgba_to_ycbcr_fn(), 4),
+            PixelFormat::Bgr => (select_bgr_to_ycbcr_fn(), 3),
+            PixelFormat::Bgra => (select_bgra_to_ycbcr_fn(), 4),
+            _ => return Ok(None),
+        };
         // Pad buffer width to MCU-aligned, matching C libjpeg-turbo's behavior.
         // C allocates coefficient buffers padded to MCU boundaries and pads input
         // with expand_right_edge up to width_in_blocks * DCTSIZE per component.
         // Blocks beyond width_in_blocks are left as zeros in C (never FDCT'd).
-        let padded_w: usize = mcus_x * mcu_w;
-        let padded_h: usize = mcu_h;
+        let padded_w: usize = single.mcus_x * single.mcu_w;
+        let padded_h: usize = single.mcu_h;
         let row_buf_size: usize = padded_w * padded_h;
-        let mut y_buf: Vec<u8> = vec![0u8; row_buf_size];
-        let mut cb_buf: Vec<u8> = vec![0u8; row_buf_size];
-        let mut cr_buf: Vec<u8> = vec![0u8; row_buf_size];
 
-        // For 420 on x86_64: pre-allocate half-resolution chroma buffers.
-        // After color conversion, we downsample full-res Cb/Cr into these compact
-        // buffers so that FDCT reads from stride=half_w instead of stride=padded_w.
-        //
         // Both the downsample below and the encode fast path further down call
         // `#[target_feature(enable = "avx2")]` helpers, so a single capability
         // flag gates every step. Deriving the fast path's guard from buffer
         // emptiness instead would let a non-AVX2 x86_64 CPU reach AVX2
         // intrinsics with never-downsampled (all-zero) chroma — issue #315.
-        #[cfg(all(target_arch = "x86_64", feature = "simd"))]
         // Also gated on the DCT method: this path calls the islow AVX2 kernels
         // directly, while ifast/float carry divisors scaled for their own
         // transforms (#330).
-        let use_avx2_420: bool = subsampling == Subsampling::S420
+        #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+        let use_avx2_420: bool = single.subsampling == Subsampling::S420
             && crate::cpu_has!("avx2")
-            && may_use_islow_simd_kernel(fdct_quantize_fn);
+            && may_use_islow_simd_kernel(single.tables.fdct_quantize_fn);
+        #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+        let half: usize = match use_avx2_420 {
+            true => (padded_w / 2) * (padded_h / 2),
+            false => 0,
+        };
+        Ok(Some(Self {
+            single,
+            color_convert_fn,
+            bpp,
+            y_buf: vec![0u8; row_buf_size],
+            cb_buf: vec![0u8; row_buf_size],
+            cr_buf: vec![0u8; row_buf_size],
+            #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+            use_avx2_420,
+            #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+            cb_half: vec![0u8; half],
+            #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+            cr_half: vec![0u8; half],
+            rows: 0,
+        }))
+    }
+
+    /// The rows written so far: the index of the next one.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Takes the next row, of the picture's width in samples of the format: its MCU row is
+    /// coded once the row is its last. A row past the picture's height, or shorter than its
+    /// width, is an error.
+    pub fn write_row(&mut self, row: &[u8]) -> Result<()> {
+        let Single {
+            width,
+            height,
+            mcus_x,
+            mcu_w,
+            mcu_h,
+            ..
+        } = self.single;
+        if self.rows >= height {
+            return Err(JpegError::Unsupported("all scanlines written".into()));
+        }
+        if row.len() < width * self.bpp {
+            return Err(JpegError::BufferTooSmall {
+                need: width * self.bpp,
+                got: row.len(),
+            });
+        }
+        let padded_w: usize = mcus_x * mcu_w;
+        let dst_offset: usize = (self.rows % mcu_h) * padded_w;
+        let (y_buf, cb_buf, cr_buf) = (&mut self.y_buf, &mut self.cb_buf, &mut self.cr_buf);
+        (self.color_convert_fn)(
+            &row[..width * self.bpp],
+            &mut y_buf[dst_offset..dst_offset + width],
+            &mut cb_buf[dst_offset..dst_offset + width],
+            &mut cr_buf[dst_offset..dst_offset + width],
+            width,
+        );
+        // Pad right edge by replicating last pixel to MCU-aligned width,
+        // matching C libjpeg-turbo's expand_right_edge behavior.
+        if width < padded_w {
+            let last_y: u8 = y_buf[dst_offset + width - 1];
+            let last_cb: u8 = cb_buf[dst_offset + width - 1];
+            let last_cr: u8 = cr_buf[dst_offset + width - 1];
+            for x in width..padded_w {
+                y_buf[dst_offset + x] = last_y;
+                cb_buf[dst_offset + x] = last_cb;
+                cr_buf[dst_offset + x] = last_cr;
+            }
+        }
+        self.rows += 1;
+        if self.rows % mcu_h == 0 || self.rows == height {
+            self.encode_mcu_row();
+        }
+        Ok(())
+    }
+
+    /// The file, once every row of the picture was written.
+    pub fn finish(self) -> Result<Vec<u8>> {
+        if self.rows != self.single.height {
+            return Err(JpegError::Unsupported(format!(
+                "not all scanlines written: {} of {}",
+                self.rows, self.single.height
+            )));
+        }
+        Ok(self.single.finish())
+    }
+
+    /// Codes the MCU row whose last row was just written.
+    fn encode_mcu_row(&mut self) {
+        let Single {
+            width,
+            height,
+            subsampling,
+            mcu_w,
+            mcu_h,
+            mcus_x,
+            mcus_y,
+            ref tables,
+            ref mut coder,
+            ..
+        } = self.single;
+        let (y_buf, cb_buf, cr_buf) = (&mut self.y_buf, &mut self.cb_buf, &mut self.cr_buf);
+        let mcu_row: usize = (self.rows - 1) / mcu_h;
+        let y0: usize = mcu_row * mcu_h;
+        let rows_available: usize = (height - y0).min(mcu_h);
+        let padded_w: usize = mcus_x * mcu_w;
+        let padded_h: usize = mcu_h;
+
+        // Pad remaining rows to match C libjpeg-turbo's behavior:
+        // Y component: replicate last real row (jccoefct.c expand_bottom_edge)
+        // Cb/Cr components: replicate last complete row group so that chroma
+        // downsampling produces the same result as C's two-phase approach
+        // (jcprepct.c pads to row group, downsamples, then replicates the
+        // downsampled output in jccoefct.c).
+        let last_row_offset: usize = (rows_available - 1) * padded_w;
+
+        // Y: simple last-row replication (matches C's luma behavior)
+        for row in rows_available..padded_h {
+            let dst_offset: usize = row * padded_w;
+            y_buf.copy_within(last_row_offset..last_row_offset + padded_w, dst_offset);
+        }
+
+        // Cb/Cr: row-group replication for correct chroma downsampling
+        let max_v: usize = subsampling.sampling_factors().1 as usize;
+        let row_group_end: usize = rows_available.div_ceil(max_v).min(padded_h / max_v) * max_v;
+
+        // Phase 1: complete the last row group (replicate last real row)
+        for row in rows_available..row_group_end.min(padded_h) {
+            let dst_offset: usize = row * padded_w;
+            cb_buf.copy_within(last_row_offset..last_row_offset + padded_w, dst_offset);
+            cr_buf.copy_within(last_row_offset..last_row_offset + padded_w, dst_offset);
+        }
+
+        // Phase 2: replicate the last complete row group
+        if row_group_end < padded_h {
+            let group_start: usize = row_group_end - max_v;
+            for row in row_group_end..padded_h {
+                let src_row: usize = group_start + (row - row_group_end) % max_v;
+                let dst_offset: usize = row * padded_w;
+                let src_offset: usize = src_row * padded_w;
+                cb_buf.copy_within(src_offset..src_offset + padded_w, dst_offset);
+                cr_buf.copy_within(src_offset..src_offset + padded_w, dst_offset);
+            }
+        }
+
         #[cfg(all(target_arch = "x86_64", feature = "simd"))]
         let half_w: usize = padded_w / 2;
         #[cfg(all(target_arch = "x86_64", feature = "simd"))]
-        let half_h: usize = padded_h / 2;
-        #[cfg(all(target_arch = "x86_64", feature = "simd"))]
-        let mut cb_half: Vec<u8> = if use_avx2_420 {
-            vec![0u8; half_w * half_h]
-        } else {
-            Vec::new()
-        };
-        #[cfg(all(target_arch = "x86_64", feature = "simd"))]
-        let mut cr_half: Vec<u8> = if use_avx2_420 {
-            vec![0u8; half_w * half_h]
-        } else {
-            Vec::new()
-        };
+        let use_avx2_420: bool = self.use_avx2_420;
 
-        for mcu_row in 0..mcus_y {
-            let y0: usize = mcu_row * mcu_h;
-            let rows_available: usize = (height - y0).min(mcu_h);
-
-            // Convert this MCU row's pixel data to YCbCr
-            for row in 0..rows_available {
-                let src_row: usize = y0 + row;
-                let src_offset: usize = src_row * pitch;
-                let dst_offset: usize = row * padded_w;
-                color_convert_fn(
-                    &pixels[src_offset..src_offset + width * bpp],
-                    &mut y_buf[dst_offset..dst_offset + width],
-                    &mut cb_buf[dst_offset..dst_offset + width],
-                    &mut cr_buf[dst_offset..dst_offset + width],
-                    width,
+        // For 420: downsample full-res Cb/Cr to compact half-res buffers.
+        // This allows FDCT to read from stride=half_w instead of fused
+        // downsample+FDCT from stride=padded_w, improving cache locality.
+        #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+        if use_avx2_420 {
+            unsafe {
+                crate::simd::x86_64::avx2_downsample_h2v2_plane(
+                    cb_buf,
+                    padded_w,
+                    padded_h,
+                    &mut self.cb_half,
+                    half_w,
                 );
-                // Pad right edge by replicating last pixel to MCU-aligned width,
-                // matching C libjpeg-turbo's expand_right_edge behavior.
-                if width < padded_w {
-                    let last_y: u8 = y_buf[dst_offset + width - 1];
-                    let last_cb: u8 = cb_buf[dst_offset + width - 1];
-                    let last_cr: u8 = cr_buf[dst_offset + width - 1];
-                    for x in width..padded_w {
-                        y_buf[dst_offset + x] = last_y;
-                        cb_buf[dst_offset + x] = last_cb;
-                        cr_buf[dst_offset + x] = last_cr;
-                    }
-                }
+                crate::simd::x86_64::avx2_downsample_h2v2_plane(
+                    cr_buf,
+                    padded_w,
+                    padded_h,
+                    &mut self.cr_half,
+                    half_w,
+                );
             }
-            // Pad remaining rows to match C libjpeg-turbo's behavior:
-            // Y component: replicate last real row (jccoefct.c expand_bottom_edge)
-            // Cb/Cr components: replicate last complete row group so that chroma
-            // downsampling produces the same result as C's two-phase approach
-            // (jcprepct.c pads to row group, downsamples, then replicates the
-            // downsampled output in jccoefct.c).
-            let last_row_offset: usize = (rows_available - 1) * padded_w;
+        }
 
-            // Y: simple last-row replication (matches C's luma behavior)
-            for row in rows_available..padded_h {
-                let dst_offset: usize = row * padded_w;
-                y_buf.copy_within(last_row_offset..last_row_offset + padded_w, dst_offset);
-            }
-
-            // Cb/Cr: row-group replication for correct chroma downsampling
-            let max_v: usize = subsampling.sampling_factors().1 as usize;
-            let row_group_end: usize = rows_available.div_ceil(max_v).min(padded_h / max_v) * max_v;
-
-            // Phase 1: complete the last row group (replicate last real row)
-            for row in rows_available..row_group_end.min(padded_h) {
-                let dst_offset: usize = row * padded_w;
-                cb_buf.copy_within(last_row_offset..last_row_offset + padded_w, dst_offset);
-                cr_buf.copy_within(last_row_offset..last_row_offset + padded_w, dst_offset);
-            }
-
-            // Phase 2: replicate the last complete row group
-            if row_group_end < padded_h {
-                let group_start: usize = row_group_end - max_v;
-                for row in row_group_end..padded_h {
-                    let src_row: usize = group_start + (row - row_group_end) % max_v;
-                    let dst_offset: usize = row * padded_w;
-                    let src_offset: usize = src_row * padded_w;
-                    cb_buf.copy_within(src_offset..src_offset + padded_w, dst_offset);
-                    cr_buf.copy_within(src_offset..src_offset + padded_w, dst_offset);
-                }
-            }
-
-            // For 420: downsample full-res Cb/Cr to compact half-res buffers.
-            // This allows FDCT to read from stride=half_w instead of fused
-            // downsample+FDCT from stride=padded_w, improving cache locality.
-            #[cfg(all(target_arch = "x86_64", feature = "simd"))]
-            if use_avx2_420 {
-                unsafe {
-                    crate::simd::x86_64::avx2_downsample_h2v2_plane(
-                        &cb_buf,
-                        padded_w,
-                        padded_h,
-                        &mut cb_half,
-                        half_w,
-                    );
-                    crate::simd::x86_64::avx2_downsample_h2v2_plane(
-                        &cr_buf,
-                        padded_w,
-                        padded_h,
-                        &mut cr_half,
-                        half_w,
-                    );
-                }
-            }
-
-            // Encode all MCUs in this row.
-            // For the last MCU column, C libjpeg-turbo creates "dummy" blocks
-            // for components that extend beyond width_in_blocks: all AC=0, DC
-            // copied from the previous block (jccoefct.c lines 184-191).
-            let (h_samp, v_samp) = subsampling.sampling_factors();
-            let y_width_in_blocks: usize = width.div_ceil(8);
-            let y_height_in_blocks: usize = height.div_ceil(8);
-            let y_mcu_width: usize = h_samp as usize;
-            let y_mcu_height: usize = v_samp as usize;
-            let y_last_col_width: usize = {
-                let rem: usize = y_width_in_blocks % y_mcu_width;
-                if rem == 0 {
-                    y_mcu_width
-                } else {
-                    rem
-                }
-            };
-            let y_last_row_height: usize = {
-                let rem: usize = y_height_in_blocks % y_mcu_height;
-                if rem == 0 {
-                    y_mcu_height
-                } else {
-                    rem
-                }
-            };
-            let is_last_mcu_row: bool = mcu_row == mcus_y - 1;
-            let eff_row_height: usize = if is_last_mcu_row {
-                y_last_row_height
+        // Encode all MCUs in this row.
+        // For the last MCU column, C libjpeg-turbo creates "dummy" blocks
+        // for components that extend beyond width_in_blocks: all AC=0, DC
+        // copied from the previous block (jccoefct.c lines 184-191).
+        let (h_samp, v_samp) = subsampling.sampling_factors();
+        let y_width_in_blocks: usize = width.div_ceil(8);
+        let y_height_in_blocks: usize = height.div_ceil(8);
+        let y_mcu_width: usize = h_samp as usize;
+        let y_mcu_height: usize = v_samp as usize;
+        let y_last_col_width: usize = {
+            let rem: usize = y_width_in_blocks % y_mcu_width;
+            if rem == 0 {
+                y_mcu_width
             } else {
+                rem
+            }
+        };
+        let y_last_row_height: usize = {
+            let rem: usize = y_height_in_blocks % y_mcu_height;
+            if rem == 0 {
                 y_mcu_height
+            } else {
+                rem
+            }
+        };
+        let is_last_mcu_row: bool = mcu_row == mcus_y - 1;
+        let eff_row_height: usize = if is_last_mcu_row {
+            y_last_row_height
+        } else {
+            y_mcu_height
+        };
+
+        // 420 fast path: row-level hoisted bit buffer + inline FDCT+Huffman.
+        // One begin_block/end_block per MCU row (not per MCU), eliminating
+        // ~120 ensure_capacity checks per row for 1920-wide images.
+        //
+        // It FDCTs every block of every MCU unconditionally, so it is only
+        // valid where no dummy blocks are needed: interior MCU rows
+        // (`eff_row_height == y_mcu_height`) *and* images whose last MCU
+        // column is full (`y_last_col_width == y_mcu_width`). C zeroes
+        // dummy blocks and copies the previous block's DC rather than
+        // transforming replicated edge pixels (jccoefct.c:292-312), so
+        // running this path over a partial last column produced output that
+        // diverged from cjpeg for every width with `ceil(width/8)` odd —
+        // issue #314. Partial geometries fall through to the generic path
+        // below, which handles dummies via `encode_color_mcu_with_dummies`.
+        // Where the generic loop below must pick up. The fast path covers
+        // the interior columns; a partial final column falls through.
+        // Only the x86_64 fast path below mutates this.
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let mut generic_start_col: usize = 0;
+
+        #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+        // Restarts are excluded because this path hoists one bit-buffer
+        // region across the whole MCU row; an RST marker mid-row would have
+        // to break out of it. Restart encodes take the generic path below.
+        if use_avx2_420 && coder.restart_mcu_interval == 0 && eff_row_height == y_mcu_height {
+            // Every block of every MCU is FDCT'd unconditionally here, so
+            // only columns with no dummy blocks qualify. When the last MCU
+            // column is partial it is excluded and handled generically
+            // rather than disqualifying the whole row — that costs one
+            // column instead of `mcus_x` of them (#317). C zeroes dummy
+            // blocks and copies the previous DC instead of transforming
+            // replicated edge pixels (jccoefct.c:292-312), which is what
+            // #314 got wrong.
+            let fast_cols: usize = if y_last_col_width == y_mcu_width {
+                mcus_x
+            } else {
+                mcus_x - 1
             };
+            let (cb_half, cr_half) = (&self.cb_half, &self.cr_half);
+            let Tables {
+                luma_divisors,
+                chroma_divisors,
+                huffman,
+                ..
+            } = tables;
 
-            // 420 fast path: row-level hoisted bit buffer + inline FDCT+Huffman.
-            // One begin_block/end_block per MCU row (not per MCU), eliminating
-            // ~120 ensure_capacity checks per row for 1920-wide images.
-            //
-            // It FDCTs every block of every MCU unconditionally, so it is only
-            // valid where no dummy blocks are needed: interior MCU rows
-            // (`eff_row_height == y_mcu_height`) *and* images whose last MCU
-            // column is full (`y_last_col_width == y_mcu_width`). C zeroes
-            // dummy blocks and copies the previous block's DC rather than
-            // transforming replicated edge pixels (jccoefct.c:292-312), so
-            // running this path over a partial last column produced output that
-            // diverged from cjpeg for every width with `ceil(width/8)` odd —
-            // issue #314. Partial geometries fall through to the generic path
-            // below, which handles dummies via `encode_color_mcu_with_dummies`.
-            // Where the generic loop below must pick up. The fast path covers
-            // the interior columns; a partial final column falls through.
-            // Only the x86_64 fast path below mutates this.
-            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
-            let mut generic_start_col: usize = 0;
+            if fast_cols > 0 {
+                unsafe {
+                    // Reserve capacity for the columns this path will encode
+                    let (mut pb, mut fb, mut buf) = coder.bit_writer.begin_block(3072 * fast_cols);
 
-            #[cfg(all(target_arch = "x86_64", feature = "simd"))]
-            // Restarts are excluded because this path hoists one bit-buffer
-            // region across the whole MCU row; an RST marker mid-row would have
-            // to break out of it. Restart encodes take the generic path below.
-            if use_avx2_420 && restart_mcu_interval == 0 && eff_row_height == y_mcu_height {
-                // Every block of every MCU is FDCT'd unconditionally here, so
-                // only columns with no dummy blocks qualify. When the last MCU
-                // column is partial it is excluded and handled generically
-                // rather than disqualifying the whole row — that costs one
-                // column instead of `mcus_x` of them (#317). C zeroes dummy
-                // blocks and copies the previous DC instead of transforming
-                // replicated edge pixels (jccoefct.c:292-312), which is what
-                // #314 got wrong.
-                let fast_cols: usize = if y_last_col_width == y_mcu_width {
-                    mcus_x
-                } else {
-                    mcus_x - 1
-                };
+                    for mcu_col in 0..fast_cols {
+                        let x0: usize = mcu_col * mcu_w;
+                        let cx0: usize = mcu_col * (mcu_w / 2);
 
-                if fast_cols > 0 {
-                    unsafe {
-                        // Reserve capacity for the columns this path will encode
-                        let (mut pb, mut fb, mut buf) = bit_writer.begin_block(3072 * fast_cols);
+                        // FDCT + quantize 6 blocks (4Y + Cb + Cr)
+                        let mut q: [[i16; 64]; 6] = [[0i16; 64]; 6];
+                        let y_ptr: *const u8 = y_buf.as_ptr().add(x0);
+                        crate::simd::x86_64::avx2_extract_fdct_quantize(
+                            y_ptr,
+                            padded_w,
+                            luma_divisors,
+                            &mut q[0],
+                        );
+                        crate::simd::x86_64::avx2_extract_fdct_quantize(
+                            y_ptr.add(8),
+                            padded_w,
+                            luma_divisors,
+                            &mut q[1],
+                        );
+                        crate::simd::x86_64::avx2_extract_fdct_quantize(
+                            y_ptr.add(8 * padded_w),
+                            padded_w,
+                            luma_divisors,
+                            &mut q[2],
+                        );
+                        crate::simd::x86_64::avx2_extract_fdct_quantize(
+                            y_ptr.add(8 * padded_w + 8),
+                            padded_w,
+                            luma_divisors,
+                            &mut q[3],
+                        );
+                        crate::simd::x86_64::avx2_extract_fdct_quantize(
+                            cb_half.as_ptr().add(cx0),
+                            half_w,
+                            chroma_divisors,
+                            &mut q[4],
+                        );
+                        crate::simd::x86_64::avx2_extract_fdct_quantize(
+                            cr_half.as_ptr().add(cx0),
+                            half_w,
+                            chroma_divisors,
+                            &mut q[5],
+                        );
 
-                        for mcu_col in 0..fast_cols {
-                            let x0: usize = mcu_col * mcu_w;
-                            let cx0: usize = mcu_col * (mcu_w / 2);
-
-                            // FDCT + quantize 6 blocks (4Y + Cb + Cr)
-                            let mut q: [[i16; 64]; 6] = [[0i16; 64]; 6];
-                            let y_ptr: *const u8 = y_buf.as_ptr().add(x0);
-                            crate::simd::x86_64::avx2_extract_fdct_quantize(
-                                y_ptr,
-                                padded_w,
-                                &luma_divisors,
-                                &mut q[0],
-                            );
-                            crate::simd::x86_64::avx2_extract_fdct_quantize(
-                                y_ptr.add(8),
-                                padded_w,
-                                &luma_divisors,
-                                &mut q[1],
-                            );
-                            crate::simd::x86_64::avx2_extract_fdct_quantize(
-                                y_ptr.add(8 * padded_w),
-                                padded_w,
-                                &luma_divisors,
-                                &mut q[2],
-                            );
-                            crate::simd::x86_64::avx2_extract_fdct_quantize(
-                                y_ptr.add(8 * padded_w + 8),
-                                padded_w,
-                                &luma_divisors,
-                                &mut q[3],
-                            );
-                            crate::simd::x86_64::avx2_extract_fdct_quantize(
-                                cb_half.as_ptr().add(cx0),
-                                half_w,
-                                &chroma_divisors,
-                                &mut q[4],
-                            );
-                            crate::simd::x86_64::avx2_extract_fdct_quantize(
-                                cr_half.as_ptr().add(cx0),
-                                half_w,
-                                &chroma_divisors,
-                                &mut q[5],
-                            );
-
-                            // Huffman encode 6 blocks with row-hoisted state
-                            for block in q.iter().take(4) {
-                                HuffmanEncoder::encode_block_hoisted(
-                                    &mut pb,
-                                    &mut fb,
-                                    &mut buf,
-                                    block,
-                                    &mut prev_dc_y,
-                                    &dc_luma_table,
-                                    &ac_luma_table,
-                                );
-                            }
+                        // Huffman encode 6 blocks with row-hoisted state
+                        for block in q.iter().take(4) {
                             HuffmanEncoder::encode_block_hoisted(
                                 &mut pb,
                                 &mut fb,
                                 &mut buf,
-                                &q[4],
-                                &mut prev_dc_cb,
-                                &dc_chroma_table,
-                                &ac_chroma_table,
-                            );
-                            HuffmanEncoder::encode_block_hoisted(
-                                &mut pb,
-                                &mut fb,
-                                &mut buf,
-                                &q[5],
-                                &mut prev_dc_cr,
-                                &dc_chroma_table,
-                                &ac_chroma_table,
+                                block,
+                                &mut coder.prev_dc_y,
+                                &huffman.dc_luma,
+                                &huffman.ac_luma,
                             );
                         }
-
-                        bit_writer.end_block(pb, fb, buf);
+                        HuffmanEncoder::encode_block_hoisted(
+                            &mut pb,
+                            &mut fb,
+                            &mut buf,
+                            &q[4],
+                            &mut coder.prev_dc_cb,
+                            &huffman.dc_chroma,
+                            &huffman.ac_chroma,
+                        );
+                        HuffmanEncoder::encode_block_hoisted(
+                            &mut pb,
+                            &mut fb,
+                            &mut buf,
+                            &q[5],
+                            &mut coder.prev_dc_cr,
+                            &huffman.dc_chroma,
+                            &huffman.ac_chroma,
+                        );
                     }
-                    // Only reachable with restarts disabled, but keep the counter
-                    // meaningful for every path.
-                    mcu_count += fast_cols as u32;
-                }
 
-                if fast_cols == mcus_x {
-                    continue; // whole row handled; skip the generic loop
+                    coder.bit_writer.end_block(pb, fb, buf);
                 }
-                generic_start_col = fast_cols;
+                // Only reachable with restarts disabled, but keep the counter
+                // meaningful for every path.
+                coder.mcu_count += fast_cols as u32;
             }
 
-            // Generic path for non-420, edge MCU rows, restarts, non-x86_64,
-            // and the trailing partial column left by the fast path above.
-            for mcu_col in generic_start_col..mcus_x {
-                maybe_emit_restart!();
-
-                let x0: usize = mcu_col * mcu_w;
-                let is_last_mcu_col: bool = mcu_col == mcus_x - 1;
-                let eff_col_width: usize = if is_last_mcu_col {
-                    y_last_col_width
-                } else {
-                    y_mcu_width
-                };
-
-                let need_dummies: bool =
-                    eff_col_width < y_mcu_width || eff_row_height < y_mcu_height;
-
-                if need_dummies {
-                    encode_color_mcu_with_dummies(
-                        &y_buf,
-                        &cb_buf,
-                        &cr_buf,
-                        padded_w,
-                        padded_h,
-                        x0,
-                        0,
-                        subsampling,
-                        &luma_divisors,
-                        &chroma_divisors,
-                        &dc_luma_table,
-                        &ac_luma_table,
-                        &dc_chroma_table,
-                        &ac_chroma_table,
-                        &mut bit_writer,
-                        &mut prev_dc_y,
-                        &mut prev_dc_cb,
-                        &mut prev_dc_cr,
-                        fdct_quantize_fn,
-                        eff_col_width,
-                        eff_row_height,
-                    );
-                } else {
-                    encode_color_mcu(
-                        &y_buf,
-                        &cb_buf,
-                        &cr_buf,
-                        padded_w,
-                        padded_h,
-                        x0,
-                        0,
-                        subsampling,
-                        &luma_divisors,
-                        &chroma_divisors,
-                        &dc_luma_table,
-                        &ac_luma_table,
-                        &dc_chroma_table,
-                        &ac_chroma_table,
-                        &mut bit_writer,
-                        &mut prev_dc_y,
-                        &mut prev_dc_cb,
-                        &mut prev_dc_cr,
-                        fdct_quantize_fn,
-                    );
-                }
-
-                mcu_count += 1;
+            if fast_cols == mcus_x {
+                return; // whole row handled; skip the generic loop
             }
-        }
-    } else {
-        params.packed()?;
-        // Fallback: full-plane color conversion for non-RGB formats and grayscale
-        let (y_plane, cb_plane, cr_plane) = convert_to_ycbcr(
-            pixels,
-            width,
-            height,
-            pixel_format,
-            enc_simd.rgb_to_ycbcr_row,
-        )?;
-
-        // Pad all planes to MCU-aligned dimensions so all blocks (including edge
-        // blocks) go through the NEON fused FDCT+quantize path instead of the
-        // scalar fallback.  This matches C libjpeg-turbo's expand_right_edge
-        // behavior and ensures byte-identical output.
-        let padded_w: usize = mcus_x * mcu_w;
-        let padded_h: usize = mcus_y * mcu_h;
-
-        fn pad_plane(
-            plane: &[u8],
-            src_w: usize,
-            src_h: usize,
-            dst_w: usize,
-            dst_h: usize,
-        ) -> Vec<u8> {
-            if src_w == dst_w && src_h == dst_h {
-                return plane.to_vec();
-            }
-            let mut padded: Vec<u8> = vec![0u8; dst_w * dst_h];
-            for row in 0..src_h {
-                let src_start: usize = row * src_w;
-                let dst_start: usize = row * dst_w;
-                padded[dst_start..dst_start + src_w]
-                    .copy_from_slice(&plane[src_start..src_start + src_w]);
-                if src_w < dst_w {
-                    let last_val: u8 = plane[src_start + src_w - 1];
-                    for x in src_w..dst_w {
-                        padded[dst_start + x] = last_val;
-                    }
-                }
-            }
-            if src_h < dst_h {
-                let last_row: Vec<u8> = padded[(src_h - 1) * dst_w..src_h * dst_w].to_vec();
-                for row in src_h..dst_h {
-                    let dst_start: usize = row * dst_w;
-                    padded[dst_start..dst_start + dst_w].copy_from_slice(&last_row);
-                }
-            }
-            padded
+            generic_start_col = fast_cols;
         }
 
-        /// Pad a chroma plane using row-group replication to match C libjpeg-turbo's
-        /// two-phase approach (jcprepct.c + jccoefct.c).
-        fn pad_chroma_plane(
-            plane: &[u8],
-            src_w: usize,
-            src_h: usize,
-            dst_w: usize,
-            dst_h: usize,
-            max_v: usize,
-        ) -> Vec<u8> {
-            if src_w == dst_w && src_h == dst_h {
-                return plane.to_vec();
+        // Generic path for non-420, edge MCU rows, restarts, non-x86_64,
+        // and the trailing partial column left by the fast path above.
+        for mcu_col in generic_start_col..mcus_x {
+            coder.restart();
+
+            let x0: usize = mcu_col * mcu_w;
+            let is_last_mcu_col: bool = mcu_col == mcus_x - 1;
+            let eff_col_width: usize = if is_last_mcu_col {
+                y_last_col_width
+            } else {
+                y_mcu_width
+            };
+
+            let need_dummies: bool = eff_col_width < y_mcu_width || eff_row_height < y_mcu_height;
+
+            if need_dummies {
+                encode_color_mcu_with_dummies(
+                    y_buf,
+                    cb_buf,
+                    cr_buf,
+                    padded_w,
+                    padded_h,
+                    x0,
+                    0,
+                    subsampling,
+                    &tables.luma_divisors,
+                    &tables.chroma_divisors,
+                    &tables.huffman.dc_luma,
+                    &tables.huffman.ac_luma,
+                    &tables.huffman.dc_chroma,
+                    &tables.huffman.ac_chroma,
+                    &mut coder.bit_writer,
+                    &mut coder.prev_dc_y,
+                    &mut coder.prev_dc_cb,
+                    &mut coder.prev_dc_cr,
+                    tables.fdct_quantize_fn,
+                    eff_col_width,
+                    eff_row_height,
+                );
+            } else {
+                encode_color_mcu(
+                    y_buf,
+                    cb_buf,
+                    cr_buf,
+                    padded_w,
+                    padded_h,
+                    x0,
+                    0,
+                    subsampling,
+                    &tables.luma_divisors,
+                    &tables.chroma_divisors,
+                    &tables.huffman.dc_luma,
+                    &tables.huffman.ac_luma,
+                    &tables.huffman.dc_chroma,
+                    &tables.huffman.ac_chroma,
+                    &mut coder.bit_writer,
+                    &mut coder.prev_dc_y,
+                    &mut coder.prev_dc_cb,
+                    &mut coder.prev_dc_cr,
+                    tables.fdct_quantize_fn,
+                );
             }
-            let mut padded: Vec<u8> = vec![0u8; dst_w * dst_h];
-            for row in 0..src_h {
-                let src_start: usize = row * src_w;
-                let dst_start: usize = row * dst_w;
-                padded[dst_start..dst_start + src_w]
-                    .copy_from_slice(&plane[src_start..src_start + src_w]);
-                if src_w < dst_w {
-                    let last_val: u8 = plane[src_start + src_w - 1];
-                    for x in src_w..dst_w {
-                        padded[dst_start + x] = last_val;
-                    }
-                }
-            }
-            if src_h < dst_h {
-                let row_group_end: usize = src_h.div_ceil(max_v).min(dst_h / max_v) * max_v;
-                let last_row: Vec<u8> = padded[(src_h - 1) * dst_w..src_h * dst_w].to_vec();
-                // Phase 1: pad to row group boundary
-                for row in src_h..row_group_end.min(dst_h) {
-                    let dst_start: usize = row * dst_w;
-                    padded[dst_start..dst_start + dst_w].copy_from_slice(&last_row);
-                }
-                // Phase 2: replicate last complete row group
-                if row_group_end < dst_h {
-                    let group_start: usize = row_group_end - max_v;
-                    for row in row_group_end..dst_h {
-                        let src_row: usize = group_start + (row - row_group_end) % max_v;
-                        let dst_start: usize = row * dst_w;
-                        let src_start: usize = src_row * dst_w;
-                        let src_data: Vec<u8> = padded[src_start..src_start + dst_w].to_vec();
-                        padded[dst_start..dst_start + dst_w].copy_from_slice(&src_data);
-                    }
-                }
-            }
-            padded
-        }
 
-        let (_, v_samp) = subsampling.sampling_factors();
-        let fb_max_v: usize = v_samp as usize;
-        let y_plane_padded: Vec<u8> = pad_plane(&y_plane, width, height, padded_w, padded_h);
-        let cb_plane_padded: Vec<u8> =
-            pad_chroma_plane(&cb_plane, width, height, padded_w, padded_h, fb_max_v);
-        let cr_plane_padded: Vec<u8> =
-            pad_chroma_plane(&cr_plane, width, height, padded_w, padded_h, fb_max_v);
-
-        for mcu_row in 0..mcus_y {
-            for mcu_col in 0..mcus_x {
-                maybe_emit_restart!();
-
-                let x0: usize = mcu_col * mcu_w;
-                let y0: usize = mcu_row * mcu_h;
-
-                if is_grayscale {
-                    encode_single_block(
-                        &y_plane_padded,
-                        padded_w,
-                        padded_h,
-                        x0,
-                        y0,
-                        &luma_divisors,
-                        &dc_luma_table,
-                        &ac_luma_table,
-                        &mut bit_writer,
-                        &mut prev_dc_y,
-                        fdct_quantize_fn,
-                    );
-                } else {
-                    encode_color_mcu(
-                        &y_plane_padded,
-                        &cb_plane_padded,
-                        &cr_plane_padded,
-                        padded_w,
-                        padded_h,
-                        x0,
-                        y0,
-                        subsampling,
-                        &luma_divisors,
-                        &chroma_divisors,
-                        &dc_luma_table,
-                        &ac_luma_table,
-                        &dc_chroma_table,
-                        &ac_chroma_table,
-                        &mut bit_writer,
-                        &mut prev_dc_y,
-                        &mut prev_dc_cb,
-                        &mut prev_dc_cr,
-                        fdct_quantize_fn,
-                    );
-                }
-
-                mcu_count += 1;
-            }
+            coder.mcu_count += 1;
         }
     }
-
-    bit_writer.flush();
-
-    // Assemble output: markers + entropy data + EOI
-    let mut output = Vec::with_capacity(bit_writer.data().len() + 1024);
-
-    marker_writer::write_soi(&mut output);
-    marker_writer::write_app0_jfif(&mut output);
-
-    // Quantization tables
-    marker_writer::write_dqt(&mut output, 0, &luma_quant);
-    if !is_grayscale {
-        marker_writer::write_dqt(&mut output, 1, &chroma_quant);
-    }
-
-    // Frame header. A quantization value above 255 needs 16-bit DQT entries,
-    // which baseline (SOF0) forbids, so those streams are extended sequential
-    // (SOF1). Only reachable through custom quant tables — the quality-scaled
-    // Annex K tables clamp at 255.
-    let needs_sof1: bool = luma_quant.iter().any(|&value| value > 255)
-        || (!is_grayscale && chroma_quant.iter().any(|&value| value > 255));
-    let write_frame_header = if needs_sof1 {
-        marker_writer::write_sof1
-    } else {
-        marker_writer::write_sof0
-    };
-    if is_grayscale {
-        let components = vec![(1, 1, 1, 0)];
-        write_frame_header(&mut output, width as u16, height as u16, &components);
-    } else {
-        let (h_samp, v_samp) = subsampling.sampling_factors();
-        let components = vec![
-            (1, h_samp, v_samp, 0), // Y
-            (2, 1, 1, 1),           // Cb
-            (3, 1, 1, 1),           // Cr
-        ];
-        write_frame_header(&mut output, width as u16, height as u16, &components);
-    }
-
-    // Huffman tables — the same bits/values the encoding tables were built from.
-    marker_writer::write_dht(&mut output, 0, 0, &dc_luma_bits, &dc_luma_values);
-    marker_writer::write_dht(&mut output, 1, 0, &ac_luma_bits, &ac_luma_values);
-    if !is_grayscale {
-        marker_writer::write_dht(&mut output, 0, 1, &dc_chroma_bits, &dc_chroma_values);
-        marker_writer::write_dht(&mut output, 1, 1, &ac_chroma_bits, &ac_chroma_values);
-    }
-
-    // Restart interval. Omitted entirely when zero, matching C.
-    if restart_interval > 0 {
-        marker_writer::write_dri(&mut output, restart_interval);
-    }
-
-    // Scan header
-    if is_grayscale {
-        let scan_components = vec![(1, 0, 0)];
-        marker_writer::write_sos(&mut output, &scan_components);
-    } else {
-        let scan_components = vec![
-            (1, 0, 0), // Y: DC table 0, AC table 0
-            (2, 1, 1), // Cb: DC table 1, AC table 1
-            (3, 1, 1), // Cr: DC table 1, AC table 1
-        ];
-        marker_writer::write_sos(&mut output, &scan_components);
-    }
-
-    // Entropy-coded data
-    output.extend_from_slice(bit_writer.data());
-
-    marker_writer::write_eoi(&mut output);
-
-    Ok(output)
 }
 
 /// Compress raw pixel data into a JPEG byte stream.
