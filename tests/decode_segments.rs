@@ -292,7 +292,7 @@ fn segmented_input_keeps_limits_and_requires_a_single_scan_header() {
         max_scans: 0,
         ..DecodeLimits::default()
     };
-    let before = Decoder::new_with_limits(&PHOTO[..at], limits.clone())
+    let before = Decoder::new_with_limits(&PHOTO[..at], limits)
         .err()
         .unwrap();
     let after = Decoder::new_segmented_with_limits(&PHOTO[..at], &pieces, limits)
@@ -303,7 +303,7 @@ fn segmented_input_keeps_limits_and_requires_a_single_scan_header() {
         max_pixels: 1,
         ..DecodeLimits::default()
     };
-    let before = Decoder::new_with_limits(PHOTO, limits.clone())
+    let before = Decoder::new_with_limits(PHOTO, limits)
         .unwrap()
         .decode_image()
         .unwrap_err();
