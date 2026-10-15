@@ -1240,3 +1240,18 @@ private scanline encoder state, removes two non-Drop explicit sink drops and use
 `is_multiple_of` for a row boundary. The full local suite passed after these changes.
 The engine uses `RowEncoder` directly, so the wrapper's fixed state allocation adds
 no engine allocation. No lint is suppressed.
+
+## P4-75. CI excludes pull requests to feature branches — **PARTIAL: hosted checks pending**
+
+**State: PARTIAL.** The `CI`, `Cross-Arch SIMD` and `Sanitizers` workflows accepted
+only pull requests to `main`. Remove that base filter so stacked PRs run the same
+jobs. Keep push triggers, matrices, assertions and scheduled workflows unchanged.
+
+**Acceptance.** A pull request to a feature branch runs the existing required checks
+against the intended API source, with hosted results verified before completion.
+
+**Evidence (2026-10-15).** Fork PR #2 has zero workflow runs and zero head checks.
+Actions permissions are enabled, but the workflow list is empty and the workflow
+lookup returns HTTP 404. WASM already has no PR base filter, so base filtering alone
+does not explain every missing run. A new PR event is still needed to verify the
+fork's workflow registration and hosted results. No remote pass is claimed.
