@@ -1224,15 +1224,16 @@ An 8 MiB encoded input must request exactly the same Rust allocation bytes as th
 contiguous decode. Bit-reader cursor/restart tests compare split and whole input.
 This is not a claim about C allocation, RSS or unchanged codec latency.
 
-**Status (2026-10-15): closed.** Local `cargo test` passed 2,239 tests, with
-one existing release-only restart-bomb test ignored in debug, including seven doc
-tests. The segmented matrix, cursor/restart tests and C oracles passed. An 8 MiB
-input requested the same 24,419 Rust allocation bytes through both APIs, excluding
-the caller's source and descriptor storage. `cargo clippy --lib -- -D warnings`
-passed. `cargo check --no-default-features` passed, with three existing warnings
-from std-only incremental helpers. The contiguous 16-byte refill body is unchanged;
-no codec latency benchmark or remote CI result is claimed. Engine integration follows
-a published dependency revision; the old public owning row-plan contract remains.
+**Status (2026-10-15): closed.** The final serialized local `cargo test` exited 0
+across 229 test-result groups: 2,240 passed, zero failed, one existing release-only
+restart-bomb test ignored in debug, and seven doc tests passed. The segmented matrix,
+cursor/restart tests and C oracles passed. An 8 MiB input requested the same 24,419
+Rust allocation bytes through both APIs, excluding the caller's source and descriptor
+storage. `cargo clippy --lib -- -D warnings` passed. `cargo check --no-default-features`
+passed, with three existing warnings from std-only incremental helpers. The contiguous
+16-byte refill body is unchanged; no codec latency benchmark or remote CI result is
+claimed. Engine integration follows a published dependency revision; the old public
+owning row-plan contract remains.
 
 The pinned baseline had four strict Clippy findings. This unit also boxes the
 private scanline encoder state, removes two non-Drop explicit sink drops and uses
