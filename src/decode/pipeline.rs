@@ -612,6 +612,7 @@ impl Image {
 pub struct Decoder<'a> {
     metadata: JpegMetadata,
     raw_data: &'a [u8],
+    entropy_segments: Option<(&'a [&'a [u8]], usize)>,
     routines: SimdRoutines,
     output_format: Option<PixelFormat>,
     scale: ScalingFactor,
@@ -690,6 +691,7 @@ impl<'a> Decoder<'a> {
         Ok(Self {
             metadata,
             raw_data: data,
+            entropy_segments: None,
             routines,
             output_format: None,
             scale: ScalingFactor::default(),
@@ -711,6 +713,59 @@ impl<'a> Decoder<'a> {
             resync_strategy: core::cell::RefCell::new(None),
             prefilled_baseline_planes: core::cell::RefCell::new(None),
         })
+    }
+
+    /// Parse a single-scan, 8-bit sequential Huffman JPEG from a header and
+    /// borrowed entropy pieces. `header` ends immediately after SOS; the pieces
+    /// contain the scan bytes and its terminal markers, in order. Empty pieces
+    /// and boundaries inside stuffing or restart markers are permitted.
+    ///
+    /// This uses the same configured decoder, output methods and error policy as
+    /// [`Self::new`], without joining the entropy pieces. Scaling, cropping, raw
+    /// planes, row output and metadata remain available. Other coding modes use
+    /// the existing contiguous constructor and are rejected here.
+    pub fn new_segmented(header: &'a [u8], entropy: &'a [&'a [u8]]) -> Result<Self> {
+        Self::new_segmented_with_limits(header, entropy, DecodeLimits::default())
+    }
+
+    /// [`Self::new_segmented`] with resource limits applied from header parsing.
+    pub fn new_segmented_with_limits(
+        header: &'a [u8],
+        entropy: &'a [&'a [u8]],
+        limits: DecodeLimits,
+    ) -> Result<Self> {
+        let mut decoder = Self::new_with_limits(header, limits)?;
+        let frame = &decoder.metadata.frame;
+        if frame.is_progressive
+            || frame.is_lossless
+            || decoder.metadata.is_arithmetic
+            || frame.precision != 8
+            || decoder.metadata.scans.len() != 1
+            || decoder.metadata.scan.components.len() != frame.components.len()
+        {
+            return Err(JpegError::Unsupported(
+                "segmented input requires one 8-bit sequential Huffman scan".into(),
+            ));
+        }
+        if header.len() != decoder.metadata.entropy_data_offset {
+            return Err(JpegError::CorruptData(
+                "segmented header must end immediately after SOS".into(),
+            ));
+        }
+        let length = entropy.iter().try_fold(0usize, |length, segment| {
+            length.checked_add(segment.len()).ok_or_else(|| {
+                JpegError::CorruptData("segmented input length exceeds usize".into())
+            })
+        })?;
+        decoder.entropy_segments = Some((entropy, length));
+        Ok(decoder)
+    }
+
+    fn bit_reader(&self, offset: usize) -> BitReader<'_> {
+        match self.entropy_segments {
+            Some((segments, length)) => BitReader::from_segments(segments, length),
+            None => BitReader::new(&self.raw_data[offset..]),
+        }
     }
 
     /// Fill in standard JPEG Huffman tables (K.3) for any unset table slot.
@@ -839,6 +894,7 @@ impl<'a> Decoder<'a> {
         Ok(Self {
             metadata,
             raw_data: body_data,
+            entropy_segments: None,
             routines,
             output_format: None,
             scale: ScalingFactor::default(),
@@ -2156,8 +2212,7 @@ impl<'a> Decoder<'a> {
             })
             .collect();
 
-        let entropy_data = &self.raw_data[self.metadata.entropy_data_offset..];
-        let mut bit_reader = BitReader::new(entropy_data);
+        let mut bit_reader = self.bit_reader(self.metadata.entropy_data_offset);
         let mut mcu_decoder = McuDecoder::new(num_components);
         let mut mcu_count: u32 = 0;
         let mut coeffs = [0i16; 64];
@@ -2424,8 +2479,7 @@ impl<'a> Decoder<'a> {
 
             let qt_values: &[u16; 64] = &quant_tables[comp_idx].values;
 
-            let entropy_data: &[u8] = &self.raw_data[scan_info.data_offset..];
-            let mut bit_reader: BitReader = BitReader::new(entropy_data);
+            let mut bit_reader = self.bit_reader(scan_info.data_offset);
             // Fresh DC prediction per scan (each non-interleaved scan starts at 0)
             let mut mcu_decoder: McuDecoder = McuDecoder::new(frame.components.len());
             let mut coeffs: [i16; 64] = [0i16; 64];
@@ -4312,7 +4366,6 @@ impl<'a> Decoder<'a> {
         };
         let image: Image = self.decode_image_with_sink(&mut sink)?;
         let sink_consumed: bool = use_sink && matches!(sink, Sink::None);
-        drop(sink);
         let row: usize = image.width * image.pixel_format.bytes_per_pixel();
         if !sink_consumed {
             let fits: bool = rows.len() >= image.height
@@ -4371,7 +4424,6 @@ impl<'a> Decoder<'a> {
         };
         let image: Image = self.decode_image_with_sink(&mut sink)?;
         let sink_consumed: bool = matches!(sink, Sink::None);
-        drop(sink);
         let row: usize = image.width * image.pixel_format.bytes_per_pixel();
         if !sink_consumed && row > 0 {
             for line in image.data.chunks_exact(row) {

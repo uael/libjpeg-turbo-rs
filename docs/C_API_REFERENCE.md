@@ -185,7 +185,7 @@
 | `jpeg_stdio_dest(cinfo, file)` | Output to FILE* | `stream::compress_to_file` / `stream::compress_to_writer` | ✅ |
 | `jpeg_stdio_src(cinfo, file)` | Input from FILE* | `stream::decompress_from_file` / `stream::decompress_from_reader` | ✅ |
 | `jpeg_mem_dest(cinfo, &outbuf, &outsize)` | Output to memory buffer | `Vec<u8>` output (native) | ✅ |
-| `jpeg_mem_src(cinfo, inbuf, insize)` | Input from memory buffer | `&[u8]` input (native) | ✅ |
+| `jpeg_mem_src(cinfo, inbuf, insize)` | Input from memory buffer | `&[u8]` input (native); `Decoder::new_segmented` also borrows entropy pieces for one 8-bit sequential Huffman scan | ✅ |
 
 ### Compression Setup
 

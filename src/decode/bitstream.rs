@@ -5,7 +5,13 @@
 /// All read/peek operations are infallible — they return 0 at EOF.
 pub struct BitReader<'a> {
     data: &'a [u8],
+    segments: &'a [&'a [u8]],
+    next_segment: usize,
+    offset: usize,
+    length: usize,
     pos: usize,
+    /// A terminating marker already found at this absolute input position.
+    marker: Option<(usize, u8)>,
     bit_buffer: u64,
     bits_left: u8,
     /// False when `data` is a partial window of a longer stream
@@ -35,11 +41,72 @@ impl<'a> BitReader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self {
             data,
+            segments: &[],
+            next_segment: 0,
+            offset: 0,
+            length: data.len(),
             pos: 0,
+            marker: None,
             bit_buffer: 0,
             bits_left: 0,
             is_final: true,
             starved: false,
+        }
+    }
+
+    pub(crate) fn from_segments(segments: &'a [&'a [u8]], length: usize) -> Self {
+        Self {
+            segments,
+            length,
+            ..Self::new(&[])
+        }
+    }
+
+    fn remaining_length(&self) -> usize {
+        self.length - self.offset
+    }
+
+    fn byte(&self, mut pos: usize) -> Option<u8> {
+        if let Some(&byte) = self.data.get(pos) {
+            return Some(byte);
+        }
+        pos -= self.data.len();
+        for segment in &self.segments[self.next_segment..] {
+            if let Some(&byte) = segment.get(pos) {
+                return Some(byte);
+            }
+            pos -= segment.len();
+        }
+        None
+    }
+
+    fn next_non_ff(&self, mut start: usize) -> (usize, Option<u8>) {
+        let mut position = start;
+        for segment in core::iter::once(&self.data).chain(self.segments[self.next_segment..].iter())
+        {
+            #[cfg(test)]
+            SEGMENT_DESCRIPTORS_VISITED.with(|visits| visits.set(visits.get() + 1));
+            if start >= segment.len() {
+                start -= segment.len();
+                continue;
+            }
+            for &byte in &segment[start..] {
+                if byte != 0xFF {
+                    return (position, Some(byte));
+                }
+                position += 1;
+            }
+            start = 0;
+        }
+        (position, None)
+    }
+
+    fn advance_segment(&mut self) {
+        while self.pos >= self.data.len() && self.next_segment < self.segments.len() {
+            self.pos -= self.data.len();
+            self.offset += self.data.len();
+            self.data = self.segments[self.next_segment];
+            self.next_segment += 1;
         }
     }
 
@@ -50,7 +117,12 @@ impl<'a> BitReader<'a> {
     pub fn resume_windowed(data: &'a [u8], state: BitReaderState, is_final: bool) -> Self {
         Self {
             data,
+            segments: &[],
+            next_segment: 0,
+            offset: 0,
+            length: data.len(),
             pos: state.pos,
+            marker: None,
             bit_buffer: state.bit_buffer,
             bits_left: state.bits_left,
             is_final,
@@ -64,7 +136,7 @@ impl<'a> BitReader<'a> {
     #[doc(hidden)]
     pub fn state(&self) -> BitReaderState {
         BitReaderState {
-            pos: self.pos,
+            pos: self.position(),
             bit_buffer: self.bit_buffer,
             bits_left: self.bits_left,
         }
@@ -150,13 +222,14 @@ impl<'a> BitReader<'a> {
 
     #[inline(never)]
     fn fill_buffer_slow(&mut self, needed: u8) {
+        self.advance_segment();
         while self.bits_left < needed.max(56) {
             if self.bits_left > 56 {
                 break;
             }
             let pos: usize = self.pos;
-            let byte: u8 = match self.data.get(pos) {
-                Some(&b) => b,
+            let byte: u8 = match self.byte(pos) {
+                Some(b) => b,
                 None => {
                     if !self.is_final {
                         self.starved = true;
@@ -179,28 +252,29 @@ impl<'a> BitReader<'a> {
             //   FF...FF XX  -> marker XX; leave one FF + marker in the
             //                  stream for the marker scanner and stuff
             //                  zeros for any further reads.
-            //   FF...FF EOF -> jump pos to data.len() so subsequent
+            //   FF...FF EOF -> jump pos to the input end so subsequent
             //                  refills short-circuit.
             // Without the marker/EOF advances below, a malformed image
             // with a long FF padding run would re-walk the entire run on
             // every refill (codex P2: O(fill_run × refills)).
-            let mut scan = pos + 1;
-            while let Some(&0xFF) = self.data.get(scan) {
-                scan += 1;
-            }
-            match self.data.get(scan) {
-                Some(&0x00) => {
+            let marker_at = self.offset + pos + 1;
+            let (scan, byte) = match self.marker.filter(|&(at, _)| at == marker_at) {
+                Some((_, marker)) => (pos + 1, Some(marker)),
+                None => self.next_non_ff(pos + 1),
+            };
+            match byte {
+                Some(0x00) => {
                     self.pos = scan + 1;
                     self.bit_buffer = (self.bit_buffer << 8) | 0xFF_u64;
                     self.bits_left += 8;
                 }
-                Some(_) => {
+                Some(marker) => {
                     // Marker found at `scan`. Park pos at the FF
                     // immediately before it so the marker scanner sees a
-                    // single `FF <marker>` pair and the next refill
-                    // classifies it in O(1) instead of re-walking the
-                    // fill run.
+                    // single `FF <marker>` pair. Keep its position because
+                    // later refills only add zero bits until the scan resets.
                     self.pos = scan - 1;
+                    self.marker = Some((self.offset + scan, marker));
                     self.bit_buffer <<= 8;
                     self.bits_left += 8;
                 }
@@ -212,7 +286,7 @@ impl<'a> BitReader<'a> {
                     // depends on bytes not buffered yet: starve WITHOUT
                     // moving pos, so the retry re-examines the run.
                     if self.is_final {
-                        self.pos = self.data.len();
+                        self.pos = self.remaining_length();
                     } else {
                         self.starved = true;
                     }
@@ -273,6 +347,7 @@ impl<'a> BitReader<'a> {
     pub fn reset(&mut self) {
         self.bit_buffer = 0;
         self.bits_left = 0;
+        self.marker = None;
 
         // Scan forward to the next restart marker (0xFF 0xDn) and consume it.
         //
@@ -288,12 +363,13 @@ impl<'a> BitReader<'a> {
         // stuffing and `0xFF 0xFF` fill runs are walked like data; any
         // non-restart marker (EOI/SOS/…) stops the scan without being
         // consumed so end-of-scan handling still sees it.
-        while self.pos + 1 < self.data.len() {
-            if self.data[self.pos] != 0xFF {
+        while self.pos + 1 < self.remaining_length() {
+            self.advance_segment();
+            if self.byte(self.pos).unwrap_or(0) != 0xFF {
                 self.pos += 1;
                 continue;
             }
-            match self.data[self.pos + 1] {
+            match self.byte(self.pos + 1).unwrap_or(0) {
                 0xD0..=0xD7 => {
                     self.pos += 2; // consume the restart marker
                     return;
@@ -320,10 +396,12 @@ impl<'a> BitReader<'a> {
     pub fn reset_and_consume_rst(&mut self) -> Option<u8> {
         self.bit_buffer = 0;
         self.bits_left = 0;
+        self.marker = None;
 
         // Skip padding 0xFF bytes first (byte stuffing at segment boundaries).
-        while self.pos + 1 < self.data.len() && self.data[self.pos] == 0xFF {
-            let marker = self.data[self.pos + 1];
+        while self.pos + 1 < self.remaining_length() && self.byte(self.pos).unwrap_or(0) == 0xFF {
+            self.advance_segment();
+            let marker = self.byte(self.pos + 1).unwrap_or(0);
             if (0xD0..=0xD7).contains(&marker) {
                 let rst_num: u8 = marker - 0xD0;
                 self.pos += 2;
@@ -353,9 +431,11 @@ impl<'a> BitReader<'a> {
     pub fn scan_to_next_rst(&mut self) -> Option<u8> {
         self.bit_buffer = 0;
         self.bits_left = 0;
-        while self.pos + 1 < self.data.len() {
-            if self.data[self.pos] == 0xFF {
-                let marker = self.data[self.pos + 1];
+        self.marker = None;
+        while self.pos + 1 < self.remaining_length() {
+            self.advance_segment();
+            if self.byte(self.pos).unwrap_or(0) == 0xFF {
+                let marker = self.byte(self.pos + 1).unwrap_or(0);
                 if (0xD0..=0xD7).contains(&marker) {
                     let rst_num: u8 = marker - 0xD0;
                     self.pos += 2;
@@ -386,6 +466,12 @@ impl<'a> BitReader<'a> {
     /// Set the byte position directly (for progressive multi-scan).
     /// Resets the bit buffer.
     pub fn set_position(&mut self, pos: usize) {
+        self.marker = None;
+        if !self.segments.is_empty() {
+            self.data = &[];
+            self.next_segment = 0;
+            self.offset = 0;
+        }
         self.pos = pos;
         self.bit_buffer = 0;
         self.bits_left = 0;
@@ -393,13 +479,18 @@ impl<'a> BitReader<'a> {
 
     /// Return current byte position in the underlying data.
     pub fn position(&self) -> usize {
-        self.pos
+        self.offset + self.pos
     }
 
     /// Returns true if the reader has exhausted all input data.
     pub fn is_eof(&self) -> bool {
-        self.pos >= self.data.len()
+        self.pos >= self.remaining_length()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEGMENT_DESCRIPTORS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -483,5 +574,92 @@ mod tests {
         let mut br = BitReader::new(&data);
         br.reset();
         assert_eq!(br.position(), 1, "reset() halts on a dangling final 0xFF");
+    }
+}
+
+#[cfg(test)]
+mod segmented_tests {
+    use super::BitReader;
+    use super::SEGMENT_DESCRIPTORS_VISITED;
+
+    #[test]
+    fn a_terminal_marker_is_found_once_across_empty_segments_until_reset_or_seek() {
+        const EMPTY: usize = 4_096;
+        let ff = [0xFF];
+        let eoi = [0xD9];
+        let mut pieces = Vec::with_capacity(EMPTY + 2);
+        pieces.push(&ff[..]);
+        pieces.extend(std::iter::repeat_n(&[][..], EMPTY));
+        pieces.push(&eoi[..]);
+        let mut expected = BitReader::new(&[0xFF, 0xD9]);
+        let expected = (0..400).map(|_| expected.read_bits(1)).collect::<Vec<_>>();
+
+        let mut actual = BitReader::from_segments(&pieces, 2);
+        SEGMENT_DESCRIPTORS_VISITED.with(|visits| visits.set(0));
+        let first = (0..400).map(|_| actual.read_bits(1)).collect::<Vec<_>>();
+        assert_eq!(first, expected);
+        let scanned = SEGMENT_DESCRIPTORS_VISITED.with(std::cell::Cell::get);
+        assert_eq!(scanned, EMPTY + 2, "one descriptor walk finds EOI");
+
+        let repeated = (0..400).map(|_| actual.read_bits(1)).collect::<Vec<_>>();
+        assert_eq!(repeated, expected);
+        assert_eq!(
+            SEGMENT_DESCRIPTORS_VISITED.with(std::cell::Cell::get),
+            scanned,
+            "refills at the cached marker do not revisit empty descriptors"
+        );
+
+        actual.reset();
+        let after_reset = (0..400).map(|_| actual.read_bits(1)).collect::<Vec<_>>();
+        assert_eq!(after_reset, expected);
+        assert_eq!(
+            SEGMENT_DESCRIPTORS_VISITED.with(std::cell::Cell::get),
+            scanned * 2,
+            "reset clears the cache so the cursor scans its new position once"
+        );
+
+        actual.set_position(0);
+        let after_seek = (0..400).map(|_| actual.read_bits(1)).collect::<Vec<_>>();
+        assert_eq!(after_seek, expected);
+        assert_eq!(
+            SEGMENT_DESCRIPTORS_VISITED.with(std::cell::Cell::get),
+            scanned * 3,
+            "seeking clears the cache so the cursor scans its new position once"
+        );
+    }
+
+    #[test]
+    fn segmented_restart_scans_and_positions_match_slices() {
+        for data in [
+            &b""[..],
+            &[
+                0x12, 0xFF, 0, 0x34, 0xFF, 0xFF, 0xD0, 0x56, 0xFF, 0xD1, 0xFF, 0xD9,
+            ],
+            &[0xFF, 0xFF, 0xFF],
+            &[0xFF, 0xD9],
+        ] {
+            for split in 0..=data.len() {
+                let pieces = [&data[..split], &[][..], &data[split..]];
+                let mut expected = BitReader::new(data);
+                let mut actual = BitReader::from_segments(&pieces, data.len());
+                for _ in 0..4 {
+                    assert_eq!(actual.read_bits(9), expected.read_bits(9));
+                    assert_eq!(actual.position(), expected.position());
+                    assert_eq!(actual.is_eof(), expected.is_eof());
+                    actual.reset();
+                    expected.reset();
+                    assert_eq!(actual.position(), expected.position());
+                    assert_eq!(
+                        actual.reset_and_consume_rst(),
+                        expected.reset_and_consume_rst()
+                    );
+                    assert_eq!(actual.scan_to_next_rst(), expected.scan_to_next_rst());
+                }
+                actual.set_position(0);
+                expected.set_position(0);
+                assert_eq!(actual.read_bits(16), expected.read_bits(16));
+                assert_eq!(actual.position(), expected.position());
+            }
+        }
     }
 }

@@ -274,6 +274,15 @@ if let Some(op) = orientation.and_then(TransformOp::from_exif_orientation) {
 }
 ```
 
+### Borrowed entropy pieces
+
+`Decoder::new_segmented(header, entropy)` reads one 8-bit sequential Huffman scan
+without joining its borrowed byte slices. The header ends immediately after SOS;
+entropy pieces include the scan and terminal markers. Empty pieces and split
+stuffing/restart markers are supported. The same scale, crop, row-output, raw-plane
+and metadata methods apply. Other coding modes retain the contiguous constructor.
+Use `new_segmented_with_limits` to set limits before parsing.
+
 ### Scanline-Level I/O
 
 ```rust
