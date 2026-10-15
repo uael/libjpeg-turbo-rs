@@ -990,7 +990,7 @@ impl RowEncoder {
             }
         }
         self.rows += 1;
-        if self.rows % mcu_h == 0 || self.rows == height {
+        if self.rows.is_multiple_of(mcu_h) || self.rows == height {
             self.encode_mcu_row();
         }
         Ok(())

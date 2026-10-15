@@ -1202,3 +1202,40 @@ C expands instead of ignoring: `djpeg -rgb` on a `cjpeg -precision 12` grayscale
 **Motivation.** Filed 2026-07-28 from #386's first fully clean worktree run. Five capi test files build the release cdylib path as `<workspace_root>/target/release/liblibjpeg_turbo_rs_capi.*` — `format_message.rs` `cdylib_path()` (8 tests), `capi_jpeg_read_header_tables_only.rs` (3), `install_layout.rs` `ensure_cdylib()` (2), `symbol_inventory.rs` (2), `tjunittest_link.rs` (2), 17 tests in total — while the `cargo build -p libjpeg-turbo-rs-capi --release` they spawn inherits the caller's `CARGO_TARGET_DIR`. Two more break one level down: `libtiff_integration.rs` and `capi_pillow_compat.rs` resolve (or delegate) correctly but spawn `examples/*/{build,run}.sh`, which default to `$REPO_ROOT/target/release` and are handed no override. Consequences on a host that offloads the target dir (this repo's standard setup): a fresh checkout FAILS all of them (build lands elsewhere, probe misses), and a checkout with an old in-repo `target/release/` silently dlopens the **stale** shim — the main checkout had exactly that, so weeks of local capi "greens" validated an outdated artifact. CI is unaffected (no `CARGO_TARGET_DIR` override). `examples/pillow_smoke/run.sh` was fixed in the #386 branch; `tests/capi_stock_tool_link.rs` is the complete pattern to copy — it resolves `CARGO_TARGET_DIR` itself (absolute or repo-relative) *and* passes `CAPI_TARGET_DIR` / `SHIM_DIR` into the scripts it spawns.
 
 **Acceptance criteria.** A shared helper (e.g. `tests/helpers`) resolves the cdylib honoring `CARGO_TARGET_DIR` (absolute or repo-relative), used by every dlopen-class test and passed through to every spawned harness script; each test dlopens an artifact at least as new as the current `src/` mtime or rebuilds unconditionally; a worktree with `CARGO_TARGET_DIR` set and no in-repo `target/` passes the full capi suite.
+
+
+## P4-74. Configured decode from borrowed entropy pieces — **CLOSED 2026-10-15**
+
+**Motivation.** The engine reads selected restart intervals from a derived rows file.
+The configured slice decoder supports its scale, crop, raw samples, row sink and
+ICC metadata, but required a joined copy of all selected compressed MCU bytes.
+The incremental reader has different configuration/output limits and is not a
+compatible substitute for this consumer.
+
+**Acceptance.** An additive borrowed-piece entry reuses the configured decoder,
+keeps the contiguous fast window, and copies no payload. Empty pieces, split
+stuffing/restart markers, EOI/truncation, malformed-input recovery, metadata and
+resource limits match the contiguous path. The consumer's derived stream is one
+8-bit sequential Huffman scan; all other coding modes retain the old slice API.
+
+**Proof.** `tests/decode_segments.rs` compares configured callbacks,
+caller rows, raw planes, scales, crops, metadata and errors, with C pixel oracles.
+An 8 MiB encoded input must request exactly the same Rust allocation bytes as the
+contiguous decode. Bit-reader cursor/restart tests compare split and whole input.
+This is not a claim about C allocation, RSS or unchanged codec latency.
+
+**Status (2026-10-15): closed.** Local `cargo test` passed 2,239 tests, with
+one existing release-only restart-bomb test ignored in debug, including seven doc
+tests. The segmented matrix, cursor/restart tests and C oracles passed. An 8 MiB
+input requested the same 24,419 Rust allocation bytes through both APIs, excluding
+the caller's source and descriptor storage. `cargo clippy --lib -- -D warnings`
+passed. `cargo check --no-default-features` passed, with three existing warnings
+from std-only incremental helpers. The contiguous 16-byte refill body is unchanged;
+no codec latency benchmark or remote CI result is claimed. Engine integration follows
+a published dependency revision; the old public owning row-plan contract remains.
+
+The pinned baseline had four strict Clippy findings. This unit also boxes the
+private scanline encoder state, removes two non-Drop explicit sink drops and uses
+`is_multiple_of` for a row boundary. The full local suite passed after these changes.
+The engine uses `RowEncoder` directly, so the wrapper's fixed state allocation adds
+no engine allocation. No lint is suppressed.

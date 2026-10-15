@@ -37,6 +37,8 @@ Phase 3 history: P3-1 / P3-2 / P3-3 / P3-4 / P3-5 / P3-6 all CLOSED. P3-2 closed
 
 ---
 
+Fork addition (2026-10-15): [P4-74](last_mile/phase4.md#p4-74-configured-decode-from-borrowed-entropy-pieces--closed-2026-10-15) adds borrowed entropy pieces to the configured decoder. Local package tests and strict Clippy pass; engine integration needs a published dependency revision.
+
 ## Replacement Gate (7-item checklist)
 
 Do not call the project a libjpeg-turbo C replacement until all are true:

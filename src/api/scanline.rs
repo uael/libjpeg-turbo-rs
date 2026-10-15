@@ -12,6 +12,7 @@ use crate::common::error::{JpegError, Result};
 use crate::common::types::{ColorSpace, DctMethod, FrameHeader, PixelFormat, Subsampling};
 use crate::decode::pipeline::{Decoder, Image};
 use crate::encode::pipeline::{CompressParams, RowEncoder};
+use alloc::boxed::Box;
 #[allow(unused_imports)]
 use alloc::vec::Vec;
 #[allow(unused_imports)]
@@ -209,7 +210,7 @@ pub struct ScanlineEncoder {
 /// come, or kept whole for a format the row encode does not take.
 enum Rows {
     Waiting,
-    Coded(RowEncoder),
+    Coded(Box<RowEncoder>),
     Kept {
         pixels: Vec<u8>,
         current_line: usize,
@@ -261,7 +262,7 @@ impl ScanlineEncoder {
             )
             .dct_method(DctMethod::IsLow);
             self.rows = match RowEncoder::new(&params)? {
-                Some(encoder) => Rows::Coded(encoder),
+                Some(encoder) => Rows::Coded(Box::new(encoder)),
                 None => Rows::Kept {
                     pixels: vec![
                         0u8;

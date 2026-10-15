@@ -378,6 +378,7 @@
 ### Source / Destination
 - [x] Memory-to-memory compress (`Vec<u8>` output)
 - [x] Memory-to-memory decompress (byte slice → `Image`)
+- [x] Borrowed entropy pieces for one 8-bit sequential Huffman scan (`Decoder::new_segmented`; configured rows/raw/scale/crop/metadata, no input concatenation)
 - [x] `jpeg_stdio_dest()` / `jpeg_stdio_src()` — File I/O (`stream::compress_to_file` / `stream::decompress_from_file`)
 - [x] `jpeg_mem_dest()` / `jpeg_mem_src()` — C memory I/O (Rust equivalent: already native)
 - [x] Custom `jpeg_destination_mgr` — User-defined output stream (`stream::compress_to_writer`)
